@@ -1,11 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
+
+	"github.com/charmbracelet/x/term"
 )
 
 const usage = `pcx - tmux-backed process manager
@@ -13,6 +20,7 @@ const usage = `pcx - tmux-backed process manager
   pcx                      open the TUI (starts the session, autostarts enabled processes)
   pcx up [name...]         start processes detached (no names: every non-disabled one)
   pcx down [-9] [name...]  stop processes (SIGTERM, or SIGKILL with -9)
+                           down, restart and kill ask before acting
   pcx restart [name...]
   pcx status
   pcx logs <name> [-n N]   dump a process's output from the tmux scrollback
@@ -20,6 +28,7 @@ const usage = `pcx - tmux-backed process manager
   pcx kill                 kill the whole tmux session
 
   -f <file>                config file (default: search up for process-compose-x.yaml)
+  -y                       skip the confirmation on destructive commands
 `
 
 func main() {
@@ -39,6 +48,8 @@ func main() {
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}
+	// accepted anywhere, so `pcx down web -y` works like `pcx -y down web`
+	args, yes := takeFlag(args, "-y", "--yes")
 
 	switch cmd {
 	case "":
@@ -59,21 +70,21 @@ func main() {
 		}
 
 	case "down":
+		args, hard := takeFlag(args, "-9", "--kill")
 		sig := syscall.SIGTERM
-		var names []string
-		for _, a := range args {
-			if a == "-9" || a == "--kill" {
-				sig = syscall.SIGKILL
-			} else {
-				names = append(names, a)
-			}
+		if hard {
+			sig = syscall.SIGKILL
 		}
-		for _, n := range pick(cfg, names, false) {
+		names := pick(cfg, args, false)
+		confirm(yes, "send %v to %s", sig, describe(names))
+		for _, n := range names {
 			fmt.Println(sess.Stop(n, sig))
 		}
 
 	case "restart":
-		for _, n := range pick(cfg, args, false) {
+		names := pick(cfg, args, false)
+		confirm(yes, "restart %s", describe(names))
+		for _, n := range names {
 			fmt.Println(sess.Restart(n))
 		}
 
@@ -107,6 +118,7 @@ func main() {
 		check(c.Run())
 
 	case "kill":
+		confirm(yes, "kill session %s and every process in it", cfg.Name)
 		if sess.Exists() {
 			_, err := tmux("kill-session", "-t", sess.target())
 			check(err)
@@ -155,6 +167,47 @@ func printStatus(cfg *Config, sess *Session) {
 			cpu, rss := totals(table, w.PID)
 			fmt.Printf("%-24s %-16s %-14s %7.1f%% %10s %d\n", n, p.Namespace, "running", cpu, human(rss), w.PID)
 		}
+	}
+}
+
+// takeFlag removes a boolean flag from args, wherever it appears.
+func takeFlag(args []string, names ...string) ([]string, bool) {
+	found := false
+	out := args[:0:0]
+	for _, a := range args {
+		if slices.Contains(names, a) {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, found
+}
+
+func describe(names []string) string {
+	if len(names) == 1 {
+		return names[0]
+	}
+	return fmt.Sprintf("%d processes (%s)", len(names), strings.Join(names, ", "))
+}
+
+// confirm gates destructive commands. Without a terminal to ask on it refuses
+// rather than assuming yes, so scripts have to opt in with -y.
+func confirm(yes bool, format string, a ...any) {
+	if yes {
+		return
+	}
+	if !term.IsTerminal(os.Stdin.Fd()) { // never block a script on an answer
+		fatal("%s: no terminal to confirm on, pass -y", fmt.Sprintf(format, a...))
+	}
+	fmt.Fprintf(os.Stderr, "%s? [y/N] ", fmt.Sprintf(format, a...))
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	resp := strings.TrimSpace(line)
+	if errors.Is(err, io.EOF) && resp == "" { // no terminal to answer on
+		fatal("\nnothing to read an answer from, pass -y to skip the confirmation")
+	}
+	if resp != "y" && resp != "Y" && resp != "yes" {
+		fatal("cancelled")
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 	"time"
 )
 
@@ -117,4 +119,63 @@ func waitFor(t *testing.T, s *Session, ok func(Window) bool) Window {
 	}
 	t.Fatalf("timed out; windows=%v", s.Windows())
 	return Window{}
+}
+
+// The confirmation gate is the point: 'x' must not stop anything until 'y'.
+func TestStopNeedsConfirmation(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "process-compose-x.yaml")
+	os.WriteFile(path, []byte(`
+name: pcx-test-confirm
+processes:
+  spawner:
+    command: "sleep 300"
+    namespace: test
+`), 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(cfg)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", s.target()).Run() })
+	s.Start("spawner")
+	waitFor(t, s, func(w Window) bool { return !w.Dead })
+
+	m := newModel(cfg, s)
+	m.wins, m.table = s.Windows(), psTable()
+	m.build()
+	for i, r := range m.rows {
+		if r.proc == "spawner" {
+			m.cursor = i
+		}
+	}
+
+	press := func(m model, key string) model {
+		next, _ := m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		return next.(model)
+	}
+	alive := func() bool { w, ok := s.Windows()["spawner"]; return ok && !w.Dead }
+
+	m = press(m, "x")
+	if m.pending == nil {
+		t.Fatal("stop was not gated behind a confirmation")
+	}
+	if !alive() {
+		t.Fatal("stop ran before it was confirmed")
+	}
+
+	m = press(m, "n") // anything but y cancels
+	if m.pending != nil || !alive() {
+		t.Fatal("n should cancel the pending stop")
+	}
+
+	m = press(m, "x")
+	m = press(m, "y")
+	if m.pending != nil {
+		t.Fatal("y should clear the prompt")
+	}
+	waitFor(t, s, func(w Window) bool { return w.Dead })
 }

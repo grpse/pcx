@@ -22,7 +22,11 @@ pcx logs <name> [-n N]   # dump the tmux scrollback
 pcx attach <name>        # jump to the process's tmux window
 pcx kill                 # kill the whole tmux session
 pcx -f other.yaml ...    # default: search up for process-compose-x.yaml
+pcx down -y ...          # -y skips the confirmation
 ```
+
+`down`, `restart` and `kill` ask before they act. Without a terminal to ask on
+they refuse rather than assuming yes, so scripts have to pass `-y`.
 
 Config lives in `process-compose-x.yaml` (`process-compose.yaml` also works),
 found by walking up from the working directory.
@@ -33,9 +37,11 @@ found by walking up from the working directory.
 |---|---|
 | `↑`/`↓`, `j`/`k`, `g`/`G` | move |
 | `space`, `enter` | expand/collapse (process trees start collapsed) |
-| `s` `x` `X` `r` | start · stop (TERM) · kill (KILL) · restart |
+| `s` | start |
+| `x` `X` `r` | stop (TERM) · kill (KILL) · restart — each asks `[y/N]` first |
 | `o` | open the process's live output in tmux |
-| `u` `d` | start/stop everything |
+| `u` `d` | start / stop everything (`d` asks first) |
+| `y` | confirm a pending action; any other key cancels |
 | `q` | quit — processes keep running |
 
 On a namespace header, `s`/`x`/`r` apply to every process in it.

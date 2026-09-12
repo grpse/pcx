@@ -36,6 +36,14 @@ type refreshMsg struct {
 
 type tickMsg time.Time
 
+type statusMsg string
+
+// pending is a destructive action waiting on a y/N confirmation.
+type pending struct {
+	prompt string
+	run    func() tea.Cmd
+}
+
 type model struct {
 	cfg      *Config
 	sess     *Session
@@ -47,6 +55,7 @@ type model struct {
 	height   int
 	width    int
 	status   string
+	pending  *pending
 }
 
 func newModel(cfg *Config, s *Session) model {
@@ -78,6 +87,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		m.wins, m.table = msg.wins, msg.table
 		m.build()
+	case statusMsg:
+		m.status = string(msg)
 	case tea.KeyMsg:
 		return m.key(msg)
 	}
@@ -89,6 +100,16 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.cursor < len(m.rows) {
 		cur = m.rows[m.cursor]
 	}
+	if m.pending != nil { // every other key cancels
+		if k := msg.String(); k == "y" || k == "Y" {
+			cmd := m.pending.run()
+			m.pending = nil
+			return m, cmd
+		}
+		m.pending, m.status = nil, "cancelled"
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -112,25 +133,17 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.expanded[cur.key] = false
 		m.build()
 	case "s":
-		return m.each(cur, func(n string) string { return m.sess.Start(n) })
+		return m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
 	case "x":
-		return m.each(cur, func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
+		return m.ask(m.targets(cur), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "X":
-		return m.each(cur, func(n string) string { return m.sess.Stop(n, syscall.SIGKILL) })
+		return m.ask(m.targets(cur), "SIGKILL", func(n string) string { return m.sess.Stop(n, syscall.SIGKILL) })
 	case "r":
-		return m.each(cur, func(n string) string { return m.sess.Restart(n) })
+		return m.ask(m.targets(cur), "restart", func(n string) string { return m.sess.Restart(n) })
 	case "u":
-		for _, p := range m.cfg.Processes {
-			m.sess.Start(p.Name)
-		}
-		m.status = "started all"
-		return m, refresh(m.sess)
+		return m.run(m.cfg.names(), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
 	case "d":
-		for _, p := range m.cfg.Processes {
-			m.sess.Stop(p.Name, syscall.SIGTERM)
-		}
-		m.status = "stopped all"
-		return m, refresh(m.sess)
+		return m.ask(m.cfg.names(), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "o":
 		if cur.proc == "" {
 			break
@@ -144,21 +157,58 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// each applies fn to the row's process, or to every process in the namespace
-// when the cursor is on a namespace header.
-func (m model) each(cur row, fn func(string) string) (tea.Model, tea.Cmd) {
+// targets is the row's process, or every process in the namespace when the
+// cursor sits on a namespace header.
+func (m model) targets(cur row) []string {
 	if cur.proc != "" {
-		m.status = fn(cur.proc)
-		return m, refresh(m.sess)
+		return []string{cur.proc}
 	}
-	if ns, ok := strings.CutPrefix(cur.key, "ns:"); ok {
-		_, byNS := m.cfg.Namespaces()
-		for _, p := range byNS[ns] {
-			m.status = fn(p.Name)
-		}
-		m.status = ns + ": done"
+	ns, ok := strings.CutPrefix(cur.key, "ns:")
+	if !ok {
+		return nil
 	}
-	return m, refresh(m.sess)
+	_, byNS := m.cfg.Namespaces()
+	var out []string
+	for _, p := range byNS[ns] {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func (m model) run(names []string, fn func(string) string) model {
+	for _, n := range names {
+		m.status = fn(n)
+	}
+	if len(names) > 1 {
+		m.status = fmt.Sprintf("%s: %d processes", m.status, len(names))
+	}
+	return m
+}
+
+// ask stages a destructive action behind a y/N confirmation.
+func (m model) ask(names []string, verb string, fn func(string) string) (tea.Model, tea.Cmd) {
+	if len(names) == 0 {
+		return m, nil
+	}
+	what := names[0]
+	if len(names) > 1 {
+		what = fmt.Sprintf("%d processes", len(names))
+	}
+	sess := m.sess
+	m.pending = &pending{
+		prompt: fmt.Sprintf("%s %s?", verb, what),
+		run: func() tea.Cmd {
+			status := ""
+			for _, n := range names {
+				status = fn(n)
+			}
+			if len(names) > 1 {
+				status = fmt.Sprintf("%s: %d processes", verb, len(names))
+			}
+			return tea.Batch(refresh(sess), func() tea.Msg { return statusMsg(status) })
+		},
+	}
+	return m, nil
 }
 
 // build flattens the tree into the visible rows, honouring expansion state.
@@ -265,7 +315,10 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · o output · u/d all · space expand · q quit") + "\n")
-	if m.status != "" {
+	switch {
+	case m.pending != nil:
+		b.WriteString(" " + red.Render(m.pending.prompt) + bold.Render(" [y/N]"))
+	case m.status != "":
 		b.WriteString(" " + yellow.Render(m.status))
 	}
 	return b.String()
