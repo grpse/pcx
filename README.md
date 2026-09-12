@@ -41,6 +41,7 @@ found by walking up from the working directory.
 | `space`, `enter` | expand/collapse (process trees start collapsed) |
 | `s` | start |
 | `x` `X` `r` | stop (TERM) · kill (KILL) · restart — each asks `[y/N]` first |
+| `l` | sneak peek: a pane on the right with the highlighted process's live output, which follows the cursor. `l` again closes it |
 | `o` | open the process's live output — then pick `p`ane, `t`ab or `w`orkspace |
 | `u` `d` | start / stop everything (`d` asks first) |
 | `y` | confirm a pending action; any other key cancels |
@@ -67,7 +68,23 @@ running the same path and renames it — an edit never orphans running processes
 Set `name:` in the config, or pass `-n <id>`, to name an instance yourself and
 run several from one file.
 
+## Already running some other way
+
+A process you started by hand, from another tool, or from another pcx shows up
+as `external` with its real pid, CPU and memory: pcx matches the config's
+command against the process table, so the same process is managed from anywhere
+instead of being started twice. `up` refuses it, `down`/`restart` act on it.
+Only its output is missing — there is no tmux window behind it, so `logs` and
+`attach` need it started through pcx.
+
+The match is a substring of the command line, so a command that execs something
+else (`npx`, wrapper scripts) runs under different args and will not be found.
+
 ## Opening output
+
+`l` is the quick look: one split on the right that re-points itself at whatever
+the cursor is on, so moving down the list scrubs through the output of each
+process. It needs tmux, closes with `l` again, and closes when the TUI quits.
 
 `o` in the TUI (or `pcx attach`) shows a process's live output three ways:
 

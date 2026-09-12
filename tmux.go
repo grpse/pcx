@@ -74,7 +74,7 @@ func (s *Session) Adopt() {
 func (s *Session) Kill() error {
 	out, _ := tmux("list-sessions", "-F", "#{session_name}")
 	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
-		if strings.HasPrefix(name, s.cfg.Name+"-view-") {
+		if strings.HasPrefix(name, s.cfg.Name+"-view-") || name == s.peekSession() {
 			tmux("kill-session", "-t", "="+name)
 		}
 	}
@@ -91,11 +91,14 @@ type Window struct {
 	Dead     bool
 	ExitCode int    // -1 when unknown
 	Signal   string // signal name that killed the pane ("term"), empty when none
+	External bool   // running outside our session; no tmux window behind it
 }
 
 // Status is the one-word state shown by both the CLI and the TUI.
 func (w Window) Status() string {
 	switch {
+	case w.External:
+		return "external"
 	case !w.Dead:
 		return "running"
 	case w.Signal != "":
@@ -107,9 +110,14 @@ func (w Window) Status() string {
 	}
 }
 
-func (s *Session) Windows() map[string]Window {
+func (s *Session) Windows() map[string]Window { return s.WindowsWith(psTable()) }
+
+// WindowsWith takes the ps sweep from the caller, so a refresh that already has
+// one does not run a second.
+func (s *Session) WindowsWith(t Table) map[string]Window {
 	wins := map[string]Window{}
 	if !s.Exists() {
+		s.external(t, wins) // no session yet is exactly when something else is running them
 		return wins
 	}
 	out, err := tmux("list-windows", "-t", s.target(), "-F",
@@ -131,7 +139,62 @@ func (s *Session) Windows() map[string]Window {
 		wins[f[0]] = Window{Name: f[0], PID: pid, Dead: f[2] == "1", ExitCode: code,
 			Signal: strings.TrimSpace(f[4])}
 	}
+	s.external(t, wins)
 	return wins
+}
+
+// external fills in processes that are already running some other way — by
+// hand, by another tool, by another pcx — so the same process is managed from
+// anywhere instead of pcx starting a second copy of it.
+//
+// ponytail: the args have to *end* with the command, which is the shape a real
+// start has (`sh -c "cmd"`, or the exec'd program itself) and keeps shells and
+// editors that merely mention it out. A command that execs something else (npx,
+// wrapper scripts) runs under different args and will not match; start those
+// through pcx if you want them managed.
+func (s *Session) external(t Table, wins map[string]Window) {
+	ours := map[int]bool{}
+	// our own process and the shell chain above it: their command lines quote
+	// the config's commands back at us
+	for pid := os.Getpid(); pid > 1; pid = t.Procs[pid].PPID {
+		if ours[pid] {
+			break
+		}
+		ours[pid] = true
+	}
+	for _, w := range wins {
+		for _, pid := range append([]int{w.PID}, descendants(t, w.PID)...) {
+			ours[pid] = true
+		}
+	}
+	for _, name := range s.cfg.names() {
+		if w, ok := wins[name]; ok && !w.Dead {
+			continue
+		}
+		cmd := strings.TrimSpace(s.cfg.Processes[name].Command)
+		if cmd == "" {
+			continue
+		}
+		match := map[int]bool{}
+		for pid, p := range t.Procs {
+			if !ours[pid] && strings.HasSuffix(p.Args, cmd) {
+				match[pid] = true
+			}
+		}
+		// keep the root of a matching tree: `sh -c cmd` and its child both match
+		best := 0
+		for pid := range match {
+			if match[t.Procs[pid].PPID] {
+				continue
+			}
+			if best == 0 || pid < best {
+				best = pid
+			}
+		}
+		if best != 0 {
+			wins[name] = Window{Name: name, PID: best, External: true}
+		}
+	}
 }
 
 // shellCmd applies the restart policy without a supervisor: the loop lives
@@ -157,6 +220,9 @@ func (s *Session) Start(name string) string {
 		return name + ": " + err.Error()
 	}
 	w, ok := s.Windows()[name]
+	if ok && w.External {
+		return fmt.Sprintf("%s: already running outside pcx (pid %d)", name, w.PID)
+	}
 	if ok && !w.Dead {
 		return name + ": already running"
 	}
@@ -189,8 +255,14 @@ func (s *Session) Stop(name string, sig syscall.Signal) string {
 		return name + ": not running"
 	}
 	kids := descendants(psTable(), w.PID)
-	// The pane leader owns its process group; that covers the normal case.
-	_ = syscall.Kill(-w.PID, sig)
+	if w.External {
+		// not ours: its process group can be the shell job that started it, so
+		// signal only the tree we matched
+		_ = syscall.Kill(w.PID, sig)
+	} else {
+		// The pane leader owns its process group; that covers the normal case.
+		_ = syscall.Kill(-w.PID, sig)
+	}
 	for _, pid := range kids { // anything that escaped the group (setsid daemons)
 		_ = syscall.Kill(pid, sig)
 	}
@@ -250,6 +322,46 @@ func (s *Session) Open(name, mode string) (*exec.Cmd, error) {
 		return nil, err
 	}
 }
+
+// ---------------------------------------------------------------- peek
+
+// The peek pane is one nested client on one grouped session, so following the
+// cursor is a select-window rather than a new pane per process.
+func (s *Session) peekSession() string { return s.cfg.Name + "-peek" }
+
+func (s *Session) Peeking() bool {
+	return exec.Command("tmux", "has-session", "-t", "="+s.peekSession()).Run() == nil
+}
+
+// Peek splits a read-only view of name's output beside the TUI, or re-points an
+// open one at name. Focus stays on the TUI (-d), so it reads as a preview.
+func (s *Session) Peek(name string) error {
+	view := s.peekSession()
+	if os.Getenv("TMUX") == "" {
+		return fmt.Errorf("peek needs tmux")
+	}
+	if w, ok := s.Windows()[name]; !ok || w.External {
+		return fmt.Errorf("no tmux output — not started by pcx")
+	}
+	if s.Peeking() {
+		_, err := tmux("select-window", "-t", "="+view+":"+name)
+		return err
+	}
+	if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", view); err != nil {
+		return err
+	}
+	// plain name: set-option rejects the '=' exact-match prefix
+	tmux("set-option", "-t", view, "status", "off")
+	if _, err := tmux("select-window", "-t", "="+view+":"+name); err != nil {
+		return err
+	}
+	cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null", view, view)
+	_, err := tmux("split-window", "-h", "-d", cmd)
+	return err
+}
+
+// PeekClose drops the pane; the nested client exits with its session.
+func (s *Session) PeekClose() { tmux("kill-session", "-t", "="+s.peekSession()) }
 
 // ---------------------------------------------------------------- ps
 

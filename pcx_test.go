@@ -229,3 +229,46 @@ func waitFor2(t *testing.T, s *Session, name string, ok func(Window) bool) Windo
 	t.Fatalf("timed out; windows=%v", s.Windows())
 	return Window{}
 }
+
+// A process started some other way is captured: reported, not started twice,
+// and stoppable through pcx.
+func TestExternalProcessIsAdopted(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "process-compose-x.yaml")
+	cmd := "sleep 300 && echo pcx-external-" + filepath.Base(dir)
+	os.WriteFile(path, []byte("name: pcx-test-external\nprocesses:\n  outsider:\n    command: \""+cmd+"\"\n"), 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(cfg)
+	t.Cleanup(func() { s.Kill() })
+
+	// started behind pcx's back, with no session in sight
+	outside := exec.Command("/bin/sh", "-c", cmd)
+	if err := outside.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer outside.Process.Kill()
+
+	w, ok := s.Windows()["outsider"]
+	if !ok || !w.External || w.PID != outside.Process.Pid {
+		t.Fatalf("external process not captured: %+v (pid %d)", w, outside.Process.Pid)
+	}
+	if w.Status() != "external" {
+		t.Fatalf("status: %q", w.Status())
+	}
+	if msg := s.Start("outsider"); !strings.Contains(msg, "outside pcx") {
+		t.Fatalf("start should refuse a second copy, got %q", msg)
+	}
+	if msg := s.Stop("outsider", syscall.SIGKILL); !strings.Contains(msg, "sent") {
+		t.Fatalf("stop: %q", msg)
+	}
+	outside.Wait()
+	if w, ok := s.Windows()["outsider"]; ok {
+		t.Fatalf("still reported after the kill: %+v", w)
+	}
+}

@@ -32,7 +32,9 @@ const usage = `pcx - tmux-backed process manager
   pcx sessions             list running pcx sessions and their config files
 
 A config gets one session, named after a hash of its contents, so opening the
-same file from anywhere reattaches to the processes already running for it.
+same file from anywhere reattaches to the processes already running for it. A
+process already running some other way shows as "external": pcx will not start
+a second copy, and down/restart act on the one that is running.
 
   -f <file>                config file (default: search up for process-compose-x.yaml)
   -n <id>                  run a second, independent instance of the same config
@@ -177,8 +179,8 @@ func pick(cfg *Config, names []string, skipDisabled bool) []string {
 }
 
 func printStatus(cfg *Config, sess *Session) {
-	wins := sess.Windows()
 	table := psTable()
+	wins := sess.WindowsWith(table)
 	fmt.Printf("%-24s %-16s %-14s %8s %10s %s\n", "NAME", "NAMESPACE", "STATUS", "CPU", "MEM", "PID")
 	for _, n := range cfg.names() {
 		p := cfg.Processes[n]
@@ -190,7 +192,7 @@ func printStatus(cfg *Config, sess *Session) {
 			fmt.Printf("%-24s %-16s %-14s\n", n, p.Namespace, w.Status())
 		default:
 			cpu, rss := totals(table, w.PID)
-			fmt.Printf("%-24s %-16s %-14s %7.1f%% %10s %d\n", n, p.Namespace, "running", cpu, human(rss), w.PID)
+			fmt.Printf("%-24s %-16s %-14s %7.1f%% %10s %d\n", n, p.Namespace, w.Status(), cpu, human(rss), w.PID)
 		}
 	}
 }

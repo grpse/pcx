@@ -33,6 +33,7 @@ type row struct {
 type refreshMsg struct {
 	wins  map[string]Window
 	table Table
+	peek  bool // the peek pane can be closed from tmux, not just with 'l'
 }
 
 type tickMsg time.Time
@@ -58,6 +59,7 @@ type model struct {
 	width    int
 	status   string
 	asking   *ask
+	peek     bool
 }
 
 func newModel(cfg *Config, s *Session) model {
@@ -71,7 +73,10 @@ func newModel(cfg *Config, s *Session) model {
 }
 
 func refresh(s *Session) tea.Cmd {
-	return func() tea.Msg { return refreshMsg{wins: s.Windows(), table: psTable()} }
+	return func() tea.Msg {
+		table := psTable()
+		return refreshMsg{wins: s.WindowsWith(table), table: table, peek: s.Peeking()}
+	}
 }
 
 func tick() tea.Cmd {
@@ -87,7 +92,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tea.Batch(refresh(m.sess), tick())
 	case refreshMsg:
-		m.wins, m.table = msg.wins, msg.table
+		m.wins, m.table, m.peek = msg.wins, msg.table, msg.peek
 		m.build()
 	case statusMsg:
 		m.status = string(msg)
@@ -98,10 +103,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	cur := row{}
-	if m.cursor < len(m.rows) {
-		cur = m.rows[m.cursor]
-	}
+	cur := m.row()
 	if a := m.asking; a != nil {
 		run, ok := a.choices[msg.String()]
 		m.asking = nil
@@ -114,6 +116,9 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "q", "ctrl+c":
+		if m.peek {
+			m.sess.PeekClose()
+		}
 		return m, tea.Quit
 	case "down", "j":
 		m.cursor = min(m.cursor+1, len(m.rows)-1)
@@ -128,14 +133,16 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.expanded[cur.key] = !m.expanded[cur.key]
 			m.build()
 		}
-	case "right", "l":
+	case "right": // 'l' is the peek toggle; enter/space still expand
 		m.expanded[cur.key] = true
 		m.build()
 	case "left", "h":
 		m.expanded[cur.key] = false
 		m.build()
 	case "s":
-		return m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
+		m = m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) })
+		m.follow(cur.proc) // peek at what we just started
+		return m, refresh(m.sess)
 	case "x":
 		return m.confirm(m.targets(cur), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "X":
@@ -146,12 +153,29 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.run(m.cfg.names(), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
 	case "d":
 		return m.confirm(m.cfg.names(), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
+	case "l": // sneak peek: a pane on the right that follows the cursor
+		switch {
+		case m.peek:
+			m.sess.PeekClose()
+			m.peek = false
+			m.status = "peek closed"
+		case cur.proc == "":
+			m.status = "peek: put the cursor on a process"
+		default:
+			if err := m.sess.Peek(cur.proc); err != nil {
+				m.status = cur.proc + ": " + err.Error()
+				break
+			}
+			m.peek = true
+			m.status = "peeking at " + cur.proc
+		}
+
 	case "o":
 		if cur.proc == "" {
 			break
 		}
-		if _, ok := m.wins[cur.proc]; !ok {
-			m.status = cur.proc + ": no output yet, start it first"
+		if w, ok := m.wins[cur.proc]; !ok || w.External {
+			m.status = cur.proc + ": no tmux output — not started by pcx"
 			break
 		}
 		m.asking = &ask{
@@ -163,7 +187,27 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			},
 		}
 	}
+	if next := m.row(); next.proc != cur.proc { // the cursor moved to another process
+		m.follow(next.proc)
+	}
 	return m, nil
+}
+
+func (m model) row() row {
+	if m.cursor < len(m.rows) {
+		return m.rows[m.cursor]
+	}
+	return row{}
+}
+
+// follow re-points an open peek pane; a no-op when there is none.
+func (m *model) follow(proc string) {
+	if !m.peek || proc == "" {
+		return
+	}
+	if err := m.sess.Peek(proc); err != nil {
+		m.status = proc + ": " + err.Error()
+	}
 }
 
 // targets is the row's process, or every process in the namespace when the
@@ -310,7 +354,11 @@ func (m *model) procLine(p *Proc) string {
 	default:
 		cpu, rss := totals(m.table, w.PID)
 		n := len(descendants(m.table, w.PID))
-		return bold.Render(name) + green.Render(fmt.Sprintf("%-14s", "running")) +
+		style := green
+		if w.External { // ours to manage, but not ours to show output for
+			style = yellow
+		}
+		return bold.Render(name) + style.Render(fmt.Sprintf("%-14s", w.Status())) +
 			fmt.Sprintf("%6.1f%% %9s  ", cpu, human(rss)) +
 			dim.Render(fmt.Sprintf("pid %-7d %d proc", w.PID, n+1))
 	}
@@ -340,7 +388,7 @@ func (m model) View() string {
 	for i := len(m.rows) - off; i < body; i++ {
 		b.WriteString("\n")
 	}
-	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · o output · u/d all · space expand · q quit") + "\n")
+	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · l peek · o output · u/d all · space expand · q quit") + "\n")
 	switch {
 	case m.asking != nil:
 		style := bold
