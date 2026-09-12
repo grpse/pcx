@@ -45,27 +45,72 @@ func (s *Session) Ensure() (bool, error) {
 	return true, nil
 }
 
-// Adopt reattaches to the session already running this config file when the
-// file has been edited since: the name is a content hash, so it moved. Without
-// this an edit would orphan every running process.
-func (s *Session) Adopt() {
-	if !s.cfg.Derived || s.Exists() {
-		return
+// configSessions lists the other pcx sessions running this same config file: a
+// session left behind by an edit (the name is a content hash, so it moved), or
+// a second pcx that started the same commands. Hash-named ones only — `name:`
+// or -n means the user asked for a separate instance.
+func (s *Session) configSessions() []string {
+	if !s.cfg.Derived {
+		return nil
 	}
 	out, err := tmux("list-sessions", "-F", "#{session_name}")
 	if err != nil {
-		return
+		return nil
 	}
-	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
-		if !strings.HasPrefix(name, "pcx-") || strings.Contains(name, "-view-") {
+	var found []string
+	for _, name := range strings.Fields(out) {
+		// view and peek sessions are grouped with ours: same windows, not a sibling
+		if !strings.HasPrefix(name, "pcx-") || name == s.cfg.Name ||
+			strings.Contains(name, "-view-") || strings.HasSuffix(name, "-peek") {
 			continue
 		}
 		env, err := tmux("show-environment", "-t", name, "PCX_CONFIG")
 		if err != nil || strings.TrimSpace(env) != "PCX_CONFIG="+s.cfg.Path {
 			continue
 		}
-		tmux("rename-session", "-t", name, s.cfg.Name)
+		found = append(found, name)
+	}
+	return found
+}
+
+// Adopt pulls everything already running for this config into one session:
+// renames the session an edit left behind, and absorbs the windows of any other
+// pcx running the same file. Without it an edit would orphan running processes
+// and a second pcx would start a duplicate of each command.
+func (s *Session) Adopt() {
+	others := s.configSessions()
+	if len(others) == 0 {
 		return
+	}
+	if !s.Exists() {
+		tmux("rename-session", "-t", others[0], s.cfg.Name)
+		others = others[1:]
+	}
+	for _, o := range others {
+		s.absorb(o)
+	}
+}
+
+// absorb moves a sibling's windows into our session — the running process keeps
+// its pid, its output and its window, it just answers to us now — and drops the
+// sibling once it is empty.
+func (s *Session) absorb(other string) {
+	mine := listWindows(s.target())
+	for name, w := range listWindows("=" + other) {
+		if s.cfg.Processes[name] == nil {
+			continue
+		}
+		cur, have := mine[name]
+		switch {
+		case have && !cur.Dead, have && w.Dead:
+			continue // ours is the live one, or neither is: window names stay unique
+		case have:
+			tmux("kill-window", "-t", s.target()+":"+name) // our corpse, their live process
+		}
+		tmux("move-window", "-s", "="+other+":"+name, "-t", s.target()+":")
+	}
+	if len(listWindows("="+other)) == 0 { // nothing but the holder left
+		tmux("kill-session", "-t", "="+other)
 	}
 }
 
@@ -116,11 +161,44 @@ func (s *Session) Windows() map[string]Window { return s.WindowsWith(psTable()) 
 // one does not run a second.
 func (s *Session) WindowsWith(t Table) map[string]Window {
 	wins := map[string]Window{}
-	if !s.Exists() {
-		s.external(t, wins) // no session yet is exactly when something else is running them
-		return wins
+	if s.Exists() {
+		wins = listWindows(s.target())
+		if s.pull(wins) {
+			wins = listWindows(s.target())
+		}
 	}
-	out, err := tmux("list-windows", "-t", s.target(), "-F",
+	s.external(t, wins) // no session, or a process running some other way
+	return wins
+}
+
+// pull folds any other pcx session running this same config into ours, so a
+// command someone else already opened for this file is managed here instead of
+// started a second time. It only goes looking when something is not running, so
+// the steady state costs nothing.
+func (s *Session) pull(wins map[string]Window) bool {
+	if !s.missing(wins) {
+		return false
+	}
+	others := s.configSessions()
+	for _, o := range others {
+		s.absorb(o)
+	}
+	return len(others) > 0
+}
+
+func (s *Session) missing(wins map[string]Window) bool {
+	for _, n := range s.cfg.names() {
+		if w, ok := wins[n]; !ok || w.Dead {
+			return true
+		}
+	}
+	return false
+}
+
+// listWindows reads one session's windows, minus the holder.
+func listWindows(target string) map[string]Window {
+	wins := map[string]Window{}
+	out, err := tmux("list-windows", "-t", target, "-F",
 		"#{window_name}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}")
 	if err != nil {
 		return wins
@@ -139,7 +217,6 @@ func (s *Session) WindowsWith(t Table) map[string]Window {
 		wins[f[0]] = Window{Name: f[0], PID: pid, Dead: f[2] == "1", ExitCode: code,
 			Signal: strings.TrimSpace(f[4])}
 	}
-	s.external(t, wins)
 	return wins
 }
 
@@ -219,11 +296,15 @@ func (s *Session) Start(name string) string {
 	if _, err := s.Ensure(); err != nil {
 		return name + ": " + err.Error()
 	}
-	w, ok := s.Windows()[name]
+	before := listWindows(s.target()) // to tell an adoption from a plain no-op
+	w, ok := s.Windows()[name]        // absorbs another pcx's window for this config
 	if ok && w.External {
 		return fmt.Sprintf("%s: already running outside pcx (pid %d)", name, w.PID)
 	}
 	if ok && !w.Dead {
+		if b, had := before[name]; !had || b.Dead {
+			return fmt.Sprintf("%s: adopted the copy already running for this config (pid %d)", name, w.PID)
+		}
 		return name + ": already running"
 	}
 	env := []string{}

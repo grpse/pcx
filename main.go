@@ -32,9 +32,10 @@ const usage = `pcx - tmux-backed process manager
   pcx sessions             list running pcx sessions and their config files
 
 A config gets one session, named after a hash of its contents, so opening the
-same file from anywhere reattaches to the processes already running for it. A
-process already running some other way shows as "external": pcx will not start
-a second copy, and down/restart act on the one that is running.
+same file from anywhere reattaches to the processes already running for it; a
+second session for the same file is folded into it, windows and all. A process
+already running some other way shows as "external": pcx will not start a second
+copy, and down/restart act on the one that is running.
 
   -f <file>                config file (default: search up for process-compose-x.yaml)
   -n <id>                  run a second, independent instance of the same config

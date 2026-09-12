@@ -65,13 +65,21 @@ pcx-a3f35dc2         /Users/you/work/process-compose-x.yaml
 
 Editing the file changes that hash, so pcx looks for the session that was
 running the same path and renames it — an edit never orphans running processes.
+
+If a second session is running the same file anyway — two terminals racing, a
+session left over from an older edit — pcx folds it in: the windows move into
+one session, processes keep their pids and output, and the emptied session goes
+away. So starting a command that another pcx already opened for this config
+takes over that window instead of running a second copy of it.
+
 Set `name:` in the config, or pass `-n <id>`, to name an instance yourself and
-run several from one file.
+run several from one file. That opts out of all of the above — a named instance
+is meant to be separate.
 
 ## Already running some other way
 
-A process you started by hand, from another tool, or from another pcx shows up
-as `external` with its real pid, CPU and memory: pcx matches the config's
+A process you started by hand or from another tool shows up as `external` with
+its real pid, CPU and memory: pcx matches the config's
 command against the process table, so the same process is managed from anywhere
 instead of being started twice. `up` refuses it, `down`/`restart` act on it.
 Only its output is missing — there is no tmux window behind it, so `logs` and

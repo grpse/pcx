@@ -272,3 +272,49 @@ func TestExternalProcessIsAdopted(t *testing.T) {
 		t.Fatalf("still reported after the kill: %+v", w)
 	}
 }
+
+// A second pcx running the same config must not end up with two copies of the
+// same command: starting it takes over the window that is already running.
+func TestStartAdoptsSiblingSessionWindow(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "process-compose-x.yaml")
+	// no name: the session identity has to be derived for siblings to be ours
+	os.WriteFile(path, []byte("processes:\n  ticker:\n    command: \"sleep 300\"\n"), 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(cfg)
+	t.Cleanup(func() { s.Kill() })
+	if _, err := s.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	// another pcx, same config file, already running the command
+	sibling := "pcx-sibling-" + filepath.Base(dir)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", "="+sibling).Run() })
+	tmux("new-session", "-d", "-s", sibling, "-n", holder)
+	tmux("set-environment", "-t", sibling, "PCX_CONFIG", cfg.Path)
+	tmux("new-window", "-d", "-t", "="+sibling+":", "-n", "ticker", "sleep 300")
+	pid := listWindows("=" + sibling)["ticker"].PID
+	if pid == 0 {
+		t.Fatal("sibling window did not start")
+	}
+
+	if msg := s.Start("ticker"); !strings.Contains(msg, "adopted the copy already running") {
+		t.Fatalf("start should have taken the running window, got %q", msg)
+	}
+	w, ok := s.Windows()["ticker"]
+	if !ok || w.Dead || w.PID != pid {
+		t.Fatalf("adopted window lost the process: %+v want pid %d", w, pid)
+	}
+	if exec.Command("tmux", "has-session", "-t", "="+sibling).Run() == nil {
+		t.Fatal("emptied sibling session should be gone")
+	}
+	if msg := s.Start("ticker"); !strings.Contains(msg, "already running") {
+		t.Fatalf("second start: %q", msg)
+	}
+}
