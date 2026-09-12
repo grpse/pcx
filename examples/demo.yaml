@@ -1,0 +1,29 @@
+name: pcx-demo
+
+vars:
+  ROOT: "."
+
+processes:
+  ticker:
+    command: "while :; do date; sleep 2; done"
+    description: "prints the time forever"
+    namespace: demo
+
+  spawner:
+    command: "sleep 600 & sleep 600 & wait"
+    description: "spawns children, to show the tree"
+    namespace: demo
+
+  one-shot:
+    command: "echo hello && sleep 1"
+    description: "exits immediately, stays visible as exited(0)"
+    namespace: demo
+    disabled: true
+
+  flaky:
+    command: "echo restarting; sleep 3; exit 1"
+    description: "restart: always, supervised by the pane itself"
+    namespace: demo
+    disabled: true
+    availability:
+      restart: always
