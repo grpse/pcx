@@ -111,14 +111,7 @@ processes:
 
 func waitFor(t *testing.T, s *Session, ok func(Window) bool) Window {
 	t.Helper()
-	for i := 0; i < 100; i++ {
-		if w, found := s.Windows()["spawner"]; found && ok(w) {
-			return w
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("timed out; windows=%v", s.Windows())
-	return Window{}
+	return waitFor2(t, s, "spawner", ok)
 }
 
 // The confirmation gate is the point: 'x' must not stop anything until 'y'.
@@ -160,7 +153,7 @@ processes:
 	alive := func() bool { w, ok := s.Windows()["spawner"]; return ok && !w.Dead }
 
 	m = press(m, "x")
-	if m.pending == nil {
+	if m.asking == nil {
 		t.Fatal("stop was not gated behind a confirmation")
 	}
 	if !alive() {
@@ -168,14 +161,71 @@ processes:
 	}
 
 	m = press(m, "n") // anything but y cancels
-	if m.pending != nil || !alive() {
+	if m.asking != nil || !alive() {
 		t.Fatal("n should cancel the pending stop")
 	}
 
 	m = press(m, "x")
 	m = press(m, "y")
-	if m.pending != nil {
+	if m.asking != nil {
 		t.Fatal("y should clear the prompt")
 	}
 	waitFor(t, s, func(w Window) bool { return w.Dead })
+}
+
+// Identity follows the file's contents, and an edit must not orphan what is
+// already running for that file.
+func TestSessionIdentityFollowsConfigContent(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	body := "processes:\n  ticker:\n    command: \"sleep 300\"\n"
+	write := func(dir, extra string) *Config {
+		path := filepath.Join(dir, "process-compose-x.yaml")
+		os.WriteFile(path, []byte(body+extra), 0o644)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	a, b := write(t.TempDir(), ""), write(t.TempDir(), "")
+	if !a.Derived || !strings.HasPrefix(a.Name, "pcx-") {
+		t.Fatalf("name should come from the content hash, got %q", a.Name)
+	}
+	if a.Name != b.Name {
+		t.Fatalf("same contents in another directory should share a session: %q vs %q", a.Name, b.Name)
+	}
+
+	s := NewSession(a)
+	t.Cleanup(func() { s.Kill() })
+	s.Start("ticker")
+	pid := waitFor2(t, s, "ticker", func(w Window) bool { return !w.Dead }).PID
+
+	edited := write(a.Dir, "\n# a harmless edit\n")
+	if edited.Name == a.Name {
+		t.Fatal("editing the file should change the hash")
+	}
+	s2 := NewSession(edited)
+	if s2.Exists() {
+		t.Fatal("the edited config should not have a session yet")
+	}
+	s2.Adopt()
+	t.Cleanup(func() { s2.Kill() })
+	if w := waitFor2(t, s2, "ticker", func(w Window) bool { return !w.Dead }); w.PID != pid {
+		t.Fatalf("edit orphaned the running process: pid %d became %d", pid, w.PID)
+	}
+}
+
+func waitFor2(t *testing.T, s *Session, name string, ok func(Window) bool) Window {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if w, found := s.Windows()[name]; found && ok(w) {
+			return w
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out; windows=%v", s.Windows())
+	return Window{}
 }

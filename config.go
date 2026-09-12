@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,8 +33,10 @@ type Config struct {
 	Vars      map[string]string `yaml:"vars"`
 	Processes map[string]*Proc  `yaml:"processes"`
 
-	Order []string `yaml:"-"` // process names in file order
-	Dir   string   `yaml:"-"` // directory of the config file
+	Order   []string `yaml:"-"` // process names in file order
+	Dir     string   `yaml:"-"` // directory of the config file
+	Path    string   `yaml:"-"` // absolute path of the config file
+	Derived bool     `yaml:"-"` // Name came from the content hash, not the user
 }
 
 var configNames = []string{
@@ -87,9 +91,11 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	cfg.Dir = filepath.Dir(path)
+	cfg.Dir, cfg.Path = filepath.Dir(path), path
 	if cfg.Name == "" {
-		cfg.Name = filepath.Base(cfg.Dir)
+		// identity follows the file's contents, so the same config opened from
+		// anywhere lands on the session that is already running it
+		cfg.Name, cfg.Derived = "pcx-"+hash(raw), true
 	}
 	cfg.Name = sanitize(cfg.Name)
 
@@ -135,6 +141,11 @@ func expand(s string, vars map[string]string) string {
 		return s
 	}
 	return b.String()
+}
+
+func hash(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:4])
 }
 
 func sanitize(s string) string {

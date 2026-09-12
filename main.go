@@ -24,30 +24,48 @@ const usage = `pcx - tmux-backed process manager
   pcx restart [name...]
   pcx status
   pcx logs <name> [-n N]   dump a process's output from the tmux scrollback
-  pcx attach <name>        jump to a process's tmux window
+  pcx attach <name> [--pane|--tab|--workspace]
+                           show a process's live output: split the current
+                           window, open a new window, or switch to the pcx
+                           session (default). Outside tmux, all three attach.
   pcx kill                 kill the whole tmux session
+  pcx sessions             list running pcx sessions and their config files
+
+A config gets one session, named after a hash of its contents, so opening the
+same file from anywhere reattaches to the processes already running for it.
 
   -f <file>                config file (default: search up for process-compose-x.yaml)
+  -n <id>                  run a second, independent instance of the same config
   -y                       skip the confirmation on destructive commands
 `
 
 func main() {
 	fs := flag.NewFlagSet("pcx", flag.ExitOnError)
 	file := fs.String("f", "", "config file")
+	id := fs.String("n", "", "instance id (default: a hash of the config's contents)")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	_ = fs.Parse(os.Args[1:])
 	args := fs.Args()
-
-	path, err := FindConfig(*file)
-	check(err)
-	cfg, err := Load(path)
-	check(err)
-	sess := NewSession(cfg)
 
 	cmd := ""
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}
+	if cmd == "sessions" { // global: no config needed
+		listSessions()
+		return
+	}
+
+	path, err := FindConfig(*file)
+	check(err)
+	cfg, err := Load(path)
+	check(err)
+	if *id != "" {
+		cfg.Name, cfg.Derived = sanitize(*id), false
+	}
+	sess := NewSession(cfg)
+	sess.Adopt()
+
 	// accepted anywhere, so `pcx down web -y` works like `pcx -y down web`
 	args, yes := takeFlag(args, "-y", "--yes")
 
@@ -110,19 +128,26 @@ func main() {
 		fmt.Print(out)
 
 	case "attach":
+		mode := OpenWorkspace
+		for _, m := range OpenModes {
+			var found bool
+			if args, found = takeFlag(args, "--"+m); found {
+				mode = m
+			}
+		}
 		if len(args) == 0 {
 			fatal("attach: need a process name")
 		}
-		c := sess.Attach(args[0])
-		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		check(c.Run())
+		c, err := sess.Open(args[0], mode)
+		check(err)
+		if c != nil {
+			c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+			check(c.Run())
+		}
 
 	case "kill":
 		confirm(yes, "kill session %s and every process in it", cfg.Name)
-		if sess.Exists() {
-			_, err := tmux("kill-session", "-t", sess.target())
-			check(err)
-		}
+		check(sess.Kill())
 		fmt.Println(cfg.Name + ": session killed")
 
 	default:
@@ -167,6 +192,18 @@ func printStatus(cfg *Config, sess *Session) {
 			cpu, rss := totals(table, w.PID)
 			fmt.Printf("%-24s %-16s %-14s %7.1f%% %10s %d\n", n, p.Namespace, "running", cpu, human(rss), w.PID)
 		}
+	}
+}
+
+func listSessions() {
+	out, _ := tmux("list-sessions", "-F", "#{session_name}")
+	for _, n := range strings.Fields(out) {
+		// PCX_CONFIG, not the name, is what marks a session as ours
+		env, err := tmux("show-environment", "-t", n, "PCX_CONFIG")
+		if err != nil {
+			continue
+		}
+		fmt.Printf("%-20s %s\n", n, strings.TrimPrefix(strings.TrimSpace(env), "PCX_CONFIG="))
 	}
 }
 

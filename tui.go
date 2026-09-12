@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -38,10 +39,11 @@ type tickMsg time.Time
 
 type statusMsg string
 
-// pending is a destructive action waiting on a y/N confirmation.
-type pending struct {
-	prompt string
-	run    func() tea.Cmd
+// ask is a prompt waiting on a keypress; any key not in choices cancels it.
+type ask struct {
+	text    string
+	danger  bool
+	choices map[string]func() tea.Cmd
 }
 
 type model struct {
@@ -55,7 +57,7 @@ type model struct {
 	height   int
 	width    int
 	status   string
-	pending  *pending
+	asking   *ask
 }
 
 func newModel(cfg *Config, s *Session) model {
@@ -100,14 +102,14 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.cursor < len(m.rows) {
 		cur = m.rows[m.cursor]
 	}
-	if m.pending != nil { // every other key cancels
-		if k := msg.String(); k == "y" || k == "Y" {
-			cmd := m.pending.run()
-			m.pending = nil
-			return m, cmd
+	if a := m.asking; a != nil {
+		run, ok := a.choices[msg.String()]
+		m.asking = nil
+		if !ok { // every other key cancels
+			m.status = "cancelled"
+			return m, nil
 		}
-		m.pending, m.status = nil, "cancelled"
-		return m, nil
+		return m, run()
 	}
 
 	switch msg.String() {
@@ -135,15 +137,15 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		return m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
 	case "x":
-		return m.ask(m.targets(cur), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
+		return m.confirm(m.targets(cur), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "X":
-		return m.ask(m.targets(cur), "SIGKILL", func(n string) string { return m.sess.Stop(n, syscall.SIGKILL) })
+		return m.confirm(m.targets(cur), "SIGKILL", func(n string) string { return m.sess.Stop(n, syscall.SIGKILL) })
 	case "r":
-		return m.ask(m.targets(cur), "restart", func(n string) string { return m.sess.Restart(n) })
+		return m.confirm(m.targets(cur), "restart", func(n string) string { return m.sess.Restart(n) })
 	case "u":
 		return m.run(m.cfg.names(), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
 	case "d":
-		return m.ask(m.cfg.names(), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
+		return m.confirm(m.cfg.names(), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "o":
 		if cur.proc == "" {
 			break
@@ -152,7 +154,14 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = cur.proc + ": no output yet, start it first"
 			break
 		}
-		return m, tea.ExecProcess(m.sess.Attach(cur.proc), func(error) tea.Msg { return refreshMsg{m.sess.Windows(), psTable()} })
+		m.asking = &ask{
+			text: "open " + cur.proc + " in a [p]ane · [t]ab · [w]orkspace",
+			choices: map[string]func() tea.Cmd{
+				"p": m.open(cur.proc, OpenPane),
+				"t": m.open(cur.proc, OpenTab),
+				"w": m.open(cur.proc, OpenWorkspace),
+			},
+		}
 	}
 	return m, nil
 }
@@ -185,8 +194,23 @@ func (m model) run(names []string, fn func(string) string) model {
 	return m
 }
 
-// ask stages a destructive action behind a y/N confirmation.
-func (m model) ask(names []string, verb string, fn func(string) string) (tea.Model, tea.Cmd) {
+func (m model) open(name, mode string) func() tea.Cmd {
+	sess := m.sess
+	return func() tea.Cmd {
+		cmd, err := sess.Open(name, mode)
+		switch {
+		case err != nil:
+			return func() tea.Msg { return statusMsg(err.Error()) }
+		case cmd == nil:
+			return func() tea.Msg { return statusMsg(name + ": opened in a " + mode) }
+		default: // hand the terminal over for a full attach
+			return tea.ExecProcess(cmd, func(error) tea.Msg { return statusMsg("") })
+		}
+	}
+}
+
+// confirm stages a destructive action behind a y/N prompt.
+func (m model) confirm(names []string, verb string, fn func(string) string) (tea.Model, tea.Cmd) {
 	if len(names) == 0 {
 		return m, nil
 	}
@@ -195,18 +219,20 @@ func (m model) ask(names []string, verb string, fn func(string) string) (tea.Mod
 		what = fmt.Sprintf("%d processes", len(names))
 	}
 	sess := m.sess
-	m.pending = &pending{
-		prompt: fmt.Sprintf("%s %s?", verb, what),
-		run: func() tea.Cmd {
-			status := ""
-			for _, n := range names {
-				status = fn(n)
-			}
-			if len(names) > 1 {
-				status = fmt.Sprintf("%s: %d processes", verb, len(names))
-			}
-			return tea.Batch(refresh(sess), func() tea.Msg { return statusMsg(status) })
-		},
+	run := func() tea.Cmd {
+		status := ""
+		for _, n := range names {
+			status = fn(n)
+		}
+		if len(names) > 1 {
+			status = fmt.Sprintf("%s: %d processes", verb, len(names))
+		}
+		return tea.Batch(refresh(sess), func() tea.Msg { return statusMsg(status) })
+	}
+	m.asking = &ask{
+		text:    fmt.Sprintf("%s %s? [y/N]", verb, what),
+		danger:  true,
+		choices: map[string]func() tea.Cmd{"y": run, "Y": run},
 	}
 	return m, nil
 }
@@ -291,7 +317,7 @@ func (m *model) procLine(p *Proc) string {
 }
 
 func (m model) View() string {
-	head := bold.Render(" pcx ") + dim.Render("session "+m.cfg.Name) + "\n"
+	head := bold.Render(" pcx ") + dim.Render(filepath.Base(m.cfg.Path)+" · session "+m.cfg.Name) + "\n"
 	body := m.height - 4
 	if body < 3 {
 		body = 3
@@ -316,8 +342,12 @@ func (m model) View() string {
 	}
 	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · o output · u/d all · space expand · q quit") + "\n")
 	switch {
-	case m.pending != nil:
-		b.WriteString(" " + red.Render(m.pending.prompt) + bold.Render(" [y/N]"))
+	case m.asking != nil:
+		style := bold
+		if m.asking.danger {
+			style = bold.Foreground(red.GetForeground())
+		}
+		b.WriteString(" " + style.Render(m.asking.text))
 	case m.status != "":
 		b.WriteString(" " + yellow.Render(m.status))
 	}

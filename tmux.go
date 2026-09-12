@@ -37,8 +37,52 @@ func (s *Session) Ensure() (bool, error) {
 	if s.Exists() {
 		return false, nil
 	}
-	_, err := tmux("new-session", "-d", "-s", s.cfg.Name, "-n", holder)
-	return err == nil, err
+	if _, err := tmux("new-session", "-d", "-s", s.cfg.Name, "-n", holder); err != nil {
+		return false, err
+	}
+	// lets a later run find this session again after the config is edited
+	tmux("set-environment", "-t", s.cfg.Name, "PCX_CONFIG", s.cfg.Path)
+	return true, nil
+}
+
+// Adopt reattaches to the session already running this config file when the
+// file has been edited since: the name is a content hash, so it moved. Without
+// this an edit would orphan every running process.
+func (s *Session) Adopt() {
+	if !s.cfg.Derived || s.Exists() {
+		return
+	}
+	out, err := tmux("list-sessions", "-F", "#{session_name}")
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
+		if !strings.HasPrefix(name, "pcx-") || strings.Contains(name, "-view-") {
+			continue
+		}
+		env, err := tmux("show-environment", "-t", name, "PCX_CONFIG")
+		if err != nil || strings.TrimSpace(env) != "PCX_CONFIG="+s.cfg.Path {
+			continue
+		}
+		tmux("rename-session", "-t", name, s.cfg.Name)
+		return
+	}
+}
+
+// Kill destroys the session and any view sessions grouped with it. Views share
+// the windows, so leaving one alive would keep the processes alive too.
+func (s *Session) Kill() error {
+	out, _ := tmux("list-sessions", "-F", "#{session_name}")
+	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.HasPrefix(name, s.cfg.Name+"-view-") {
+			tmux("kill-session", "-t", "="+name)
+		}
+	}
+	if !s.Exists() {
+		return nil
+	}
+	_, err := tmux("kill-session", "-t", s.target())
+	return err
 }
 
 type Window struct {
@@ -158,13 +202,53 @@ func (s *Session) Restart(name string) string {
 	return s.Start(name) // respawn -k finishes off whatever survived
 }
 
-// Attach jumps to the tmux window holding a process's live output.
-func (s *Session) Attach(name string) *exec.Cmd {
-	t := s.target() + ":" + name
-	if os.Getenv("TMUX") != "" {
-		return exec.Command("tmux", "switch-client", "-t", t)
+// Open modes for a process's live output.
+const (
+	OpenPane      = "pane"      // split the current window
+	OpenTab       = "tab"       // new window in the current session
+	OpenWorkspace = "workspace" // move the client to the pcx session
+)
+
+var OpenModes = []string{OpenPane, OpenTab, OpenWorkspace}
+
+// Open shows a process's live output. It returns a command only when the
+// terminal has to be handed over (attaching from outside tmux); the tmux modes
+// do their work immediately and return nil.
+//
+// Pane and tab attach a nested client to a session grouped with ours, so the
+// process keeps its own window: closing the view cannot kill the process, which
+// linking the real window into the user's session would risk.
+func (s *Session) Open(name, mode string) (*exec.Cmd, error) {
+	win := s.target() + ":" + name
+	if os.Getenv("TMUX") == "" {
+		// nothing to split or tab into: every mode collapses to attaching
+		return exec.Command("tmux", "attach-session", "-t", win, ";", "select-window", "-t", win), nil
 	}
-	return exec.Command("tmux", "attach-session", "-t", t, ";", "select-window", "-t", t)
+	switch mode {
+	case OpenPane, OpenTab:
+		view := s.cfg.Name + "-view-" + name
+		if exec.Command("tmux", "has-session", "-t", "="+view).Run() != nil {
+			if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", view); err != nil {
+				return nil, err
+			}
+			// plain name: set-option rejects the '=' exact-match prefix
+			tmux("set-option", "-t", view, "status", "off")
+		}
+		if _, err := tmux("select-window", "-t", "="+view+":"+name); err != nil {
+			return nil, err
+		}
+		// TMUX= lets the inner client attach; the session dies with it
+		cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null", view, view)
+		if mode == OpenPane {
+			_, err := tmux("split-window", "-h", cmd)
+			return nil, err
+		}
+		_, err := tmux("new-window", "-n", name, cmd)
+		return nil, err
+	default:
+		_, err := tmux("switch-client", "-t", win)
+		return nil, err
+	}
 }
 
 // ---------------------------------------------------------------- ps
