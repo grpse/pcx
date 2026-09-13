@@ -149,8 +149,8 @@ See `examples/` for a full catalog and a demo you can run.
   the window stays, keeping its output and exit status, and `respawn-window -k`
   restarts it in place. Windows inherit the environment of the `pcx` you ran
   (minus `TMUX*`); `sudo pcx` still runs the command as `$SUDO_USER`. `PATH`
-  prefers user-space bins (nvm, fnm, volta, Homebrew) over `/usr/bin`, so
-  `node` / `npx` are the ones from your account, not the system install.
+  is the user's shell `PATH` with `~/.local/bin` and `~/bin` first, so any
+  user-space command wins over `/usr/bin`.
 - Stop signals the pane's process group, then any descendant that escaped it.
 - `restart: always` is a `while :; do ( cmd ); sleep 1; done` wrapper inside the
   pane, so nothing needs to supervise it from outside.

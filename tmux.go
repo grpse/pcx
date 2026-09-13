@@ -294,8 +294,8 @@ func shellCmd(p *Proc) string {
 	default:
 		cmd = p.Command
 	}
-	// export after the pane shell starts: macOS path_helper (in zshenv)
-	// otherwise puts /usr/bin first and the system node wins
+	// Re-export after the pane shell starts so path_helper cannot put
+	// /usr/bin ahead of the account's own bins.
 	return asCurrentUser(withUserPath(cmd))
 }
 
@@ -315,93 +315,60 @@ func resolvedUserPath() string {
 	if home == "" {
 		home, _ = os.UserHomeDir()
 	}
-	return userPath(home, os.Getenv("PATH"))
+	current := os.Getenv("PATH")
+	if sh := userShellPath(); sh != "" {
+		current = sh + ":" + current
+	}
+	return userPath(home, current)
 }
 
-// userPath puts version-manager and user-local bins in front of PATH so
-// `node` / `npx` resolve to the account's install, not /usr/bin.
+// userPath puts the account's own bin dirs in front of PATH so a command
+// installed for the user wins over /usr/bin after macOS path_helper runs.
 func userPath(home, current string) string {
 	seen := map[string]bool{}
 	var out []string
-	addDir := func(dir string) {
+	add := func(dir string, mustExist bool) {
 		if dir == "" || seen[dir] {
 			return
 		}
-		fi, err := os.Stat(dir)
-		if err != nil || !fi.IsDir() {
-			return
+		if mustExist {
+			fi, err := os.Stat(dir)
+			if err != nil || !fi.IsDir() {
+				return
+			}
 		}
 		seen[dir] = true
 		out = append(out, dir)
 	}
 	for _, dir := range userBinDirs(home) {
-		addDir(dir)
+		add(dir, true)
 	}
 	for _, dir := range strings.Split(current, ":") {
-		if dir == "" || seen[dir] {
-			continue
-		}
-		seen[dir] = true
-		out = append(out, dir)
+		add(dir, false)
 	}
 	return strings.Join(out, ":")
 }
 
 func userBinDirs(home string) []string {
-	nvm := os.Getenv("NVM_DIR")
-	if nvm == "" && home != "" {
-		nvm = filepath.Join(home, ".nvm")
-	}
-	fnm := os.Getenv("FNM_DIR")
-	if fnm == "" && home != "" {
-		fnm = filepath.Join(home, ".fnm")
+	if home == "" {
+		return nil
 	}
 	return []string{
-		nvmCurrentBin(nvm),
-		os.Getenv("FNM_MULTISHELL_PATH"),
-		filepath.Join(fnm, "aliases", "default", "bin"),
-		filepath.Join(home, ".local", "share", "fnm", "aliases", "default", "bin"),
-		filepath.Join(home, ".volta", "bin"),
-		filepath.Join(home, ".asdf", "shims"),
-		filepath.Join(home, ".local", "share", "mise", "shims"),
-		filepath.Join(home, ".nodenv", "shims"),
-		filepath.Join(home, ".bun", "bin"),
-		filepath.Join(home, ".local", "share", "pnpm"),
 		filepath.Join(home, ".local", "bin"),
-		"/opt/homebrew/bin",
+		filepath.Join(home, "bin"),
 	}
 }
 
-func nvmCurrentBin(nvm string) string {
-	if nvm == "" {
+func userShellPath() string {
+	sh := os.Getenv("SHELL")
+	if sh == "" {
 		return ""
 	}
-	seen := map[string]bool{}
-	var resolve func(string, int) string
-	resolve = func(name string, depth int) string {
-		name = strings.TrimSpace(name)
-		if name == "" || depth > 8 || seen[name] {
-			return ""
-		}
-		seen[name] = true
-		p := filepath.Join(nvm, "versions", "node", name, "bin")
-		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
-			return p
-		}
-		b, err := os.ReadFile(filepath.Join(nvm, "alias", name))
-		if err != nil {
-			return ""
-		}
-		return resolve(string(b), depth+1)
+	out, err := exec.Command(sh, "-lic", `printf %s "$PATH"`).Output()
+	if err != nil {
+		return ""
 	}
-	if p := resolve("default", 0); p != "" {
-		return p
-	}
-	current := filepath.Join(nvm, "versions", "node", "current", "bin")
-	if fi, err := os.Stat(current); err == nil && fi.IsDir() {
-		return current
-	}
-	return ""
+	return strings.TrimSpace(string(out))
 }
 
 // asCurrentUser keeps the pane on the person who invoked pcx. A root tmux

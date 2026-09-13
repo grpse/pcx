@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -121,25 +122,50 @@ func TestAsCurrentUserNoWrapWhenAlreadySelf(t *testing.T) {
 	}
 }
 
-func TestUserPathPrefersNvmOverSystem(t *testing.T) {
+func TestUserPathPrefersHomeBinsNotVendorTrees(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("NVM_DIR", "")
-	t.Setenv("FNM_DIR", "")
-	t.Setenv("FNM_MULTISHELL_PATH", "")
-	bin := filepath.Join(home, ".nvm", "versions", "node", "v22.0.0", "bin")
-	os.MkdirAll(bin, 0o755)
-	os.MkdirAll(filepath.Join(home, ".nvm", "alias"), 0o755)
-	os.WriteFile(filepath.Join(home, ".nvm", "alias", "default"), []byte("v22.0.0\n"), 0o644)
+	local := filepath.Join(home, ".local", "bin")
+	os.MkdirAll(local, 0o755)
+	os.MkdirAll(filepath.Join(home, ".nvm", "versions", "node", "v22.0.0", "bin"), 0o755)
 
 	got := userPath(home, "/usr/bin:/bin")
-	if !strings.HasPrefix(got, bin+":") {
-		t.Fatalf("user-space node should beat /usr/bin, got %q", got)
+	if !strings.HasPrefix(got, local+":") {
+		t.Fatalf("~/.local/bin should lead PATH, got %q", got)
 	}
-	if !strings.Contains(got, "/usr/bin") {
-		t.Fatalf("system PATH should still be present, got %q", got)
+	if strings.Contains(got, ".nvm") {
+		t.Fatalf("PATH must not special-case nvm, got %q", got)
 	}
-	if !strings.Contains(shellCmd(&Proc{Command: "node -v"}), "export PATH=") {
-		t.Fatal("pane command must re-export PATH after the shell starts")
+}
+
+func TestNodeExecutesFromUserSpaceNotSystem(t *testing.T) {
+	home := t.TempDir()
+	userBin := filepath.Join(home, ".local", "bin")
+	sysBin := filepath.Join(t.TempDir(), "sys")
+	os.MkdirAll(userBin, 0o755)
+	os.MkdirAll(sysBin, 0o755)
+	writeExec := func(dir, body string) {
+		p := filepath.Join(dir, "node")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExec(userBin, `echo user-space`)
+	writeExec(sysBin, `echo system`)
+
+	path := userPath(home, sysBin+":/usr/bin:/bin")
+	which, err := exec.Command("/bin/sh", "-c", "export PATH="+strconv.Quote(path)+"; command -v node").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(which)); got != filepath.Join(userBin, "node") {
+		t.Fatalf("command -v node: got %q want user-space bin", got)
+	}
+	out, err := exec.Command("/bin/sh", "-c", "export PATH="+strconv.Quote(path)+"; node").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "user-space" {
+		t.Fatalf("node ran %q, want user-space (not system)", got)
 	}
 }
 
