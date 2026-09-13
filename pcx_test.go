@@ -1,15 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"time"
 )
 
 func TestConfigExpandsVarsAndKeepsOrder(t *testing.T) {
@@ -58,6 +59,124 @@ processes:
 		Restart string `yaml:"restart"`
 	}{Restart: "always"}}); !strings.Contains(got, "while :;") || !strings.Contains(got, "( x )") {
 		t.Fatalf("restart policy not wrapped: %q", got)
+	}
+}
+
+func TestEnvFlagsOverrideAndDropTmux(t *testing.T) {
+	got := envFlags(
+		[]string{"PATH=/bin", "TMUX=old", "TMUX_PANE=%0", "HOME=/root", "MARK=from-base"},
+		[]string{"HOME=/me", "MARK=from-yaml", "EXTRA=1"},
+	)
+	want := []string{"-e", "PATH=/bin", "-e", "HOME=/me", "-e", "MARK=from-yaml", "-e", "EXTRA=1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("env flags:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestVisCmdDefaultsToTailAndScrolls(t *testing.T) {
+	long := "aaaaaaaaaaBBBBBB"
+	if got := visCmd(long, 6, 0); got != "…BBBBB" {
+		t.Fatalf("default should show the end, got %q", got)
+	}
+	if got := visCmd(long, 6, 100); got != "aaaaa…" {
+		t.Fatalf("scroll toward start, got %q", got)
+	}
+	if got := visCmd("short", 8, 0); got != "short   " {
+		t.Fatalf("short command should pad, got %q", got)
+	}
+}
+
+func TestExecutedCommandsIsTheLiveTree(t *testing.T) {
+	tble := Table{
+		Procs: map[int]PS{
+			10: {PID: 10, Args: "sh -c npx nx run web:start"},
+			11: {PID: 11, PPID: 10, Args: "node /home/me/.nvm/versions/node/v22.0.0/bin/nx"},
+		},
+		Kids: map[int][]int{10: {11}},
+	}
+	tree := commandTree(tble, 10, 0)
+	if len(tree) != 2 || tree[0] != "sh -c npx nx run web:start" || !strings.Contains(tree[1], "/home/me/.nvm") {
+		t.Fatalf("executed tree should be the full argv, got %q", tree)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "process-compose-x.yaml")
+	os.WriteFile(path, []byte("name: cmds\nprocesses:\n  web:\n    command: \"npx nx run web:start\"\n"), 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(cfg)
+	if got := s.executedCommands("web"); len(got) != 1 || got[0] != "npx nx run web:start" {
+		t.Fatalf("stopped process should show the configured command, got %q", got)
+	}
+	if s.executedCommands("") != nil {
+		t.Fatal("no process selected")
+	}
+}
+
+func TestAsCurrentUserNoWrapWhenAlreadySelf(t *testing.T) {
+	if got := asCurrentUser("echo hi"); got != "echo hi" {
+		t.Fatalf("should not wrap when already the invoking user, got %q", got)
+	}
+}
+
+func TestUserPathPrefersNvmOverSystem(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("NVM_DIR", "")
+	t.Setenv("FNM_DIR", "")
+	t.Setenv("FNM_MULTISHELL_PATH", "")
+	bin := filepath.Join(home, ".nvm", "versions", "node", "v22.0.0", "bin")
+	os.MkdirAll(bin, 0o755)
+	os.MkdirAll(filepath.Join(home, ".nvm", "alias"), 0o755)
+	os.WriteFile(filepath.Join(home, ".nvm", "alias", "default"), []byte("v22.0.0\n"), 0o644)
+
+	got := userPath(home, "/usr/bin:/bin")
+	if !strings.HasPrefix(got, bin+":") {
+		t.Fatalf("user-space node should beat /usr/bin, got %q", got)
+	}
+	if !strings.Contains(got, "/usr/bin") {
+		t.Fatalf("system PATH should still be present, got %q", got)
+	}
+	if !strings.Contains(shellCmd(&Proc{Command: "node -v"}), "export PATH=") {
+		t.Fatal("pane command must re-export PATH after the shell starts")
+	}
+}
+
+// A started process sees the environment of the pcx that launched it, not
+// whatever the tmux server happened to be started with.
+func TestProcessInheritsInvokerEnvironment(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir := t.TempDir()
+	mark := "pcx-env-" + filepath.Base(dir)
+	out := filepath.Join(dir, "mark")
+	t.Setenv("PCX_TEST_MARK", mark)
+	path := filepath.Join(dir, "process-compose-x.yaml")
+	os.WriteFile(path, []byte(fmt.Sprintf(`
+name: pcx-test-env
+processes:
+  writer:
+    command: "printf %%s \"$PCX_TEST_MARK\" > %s"
+    environment: ["PCX_TEST_EXTRA=yaml"]
+`, out)), 0o644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(cfg)
+	t.Cleanup(func() { s.Kill() })
+	if msg := s.Start("writer"); !strings.Contains(msg, "started") {
+		t.Fatal(msg)
+	}
+	waitFor2(t, s, "writer", func(w Window) bool { return w.Dead })
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != mark {
+		t.Fatalf("process did not see the invoking environment: got %q want %q", b, mark)
 	}
 }
 

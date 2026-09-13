@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,7 +16,11 @@ import (
 // managed process is stopped.
 const holder = "__pcx"
 
-type Session struct{ cfg *Config }
+type Session struct {
+	cfg      *Config
+	peekPane string // the output pane beside the TUI (#{pane_id})
+	cmdPane  string // M's command-list pane above it
+}
 
 func NewSession(c *Config) *Session { return &Session{cfg: c} }
 
@@ -37,7 +43,8 @@ func (s *Session) Ensure() (bool, error) {
 	if s.Exists() {
 		return false, nil
 	}
-	if _, err := tmux("new-session", "-d", "-s", s.cfg.Name, "-n", holder); err != nil {
+	args := append([]string{"new-session", "-d", "-s", s.cfg.Name, "-n", holder}, clientEnv()...)
+	if _, err := tmux(args...); err != nil {
 		return false, err
 	}
 	// lets a later run find this session again after the config is edited
@@ -61,7 +68,7 @@ func (s *Session) configSessions() []string {
 	for _, name := range strings.Fields(out) {
 		// view and peek sessions are grouped with ours: same windows, not a sibling
 		if !strings.HasPrefix(name, "pcx-") || name == s.cfg.Name ||
-			strings.Contains(name, "-view-") || strings.HasSuffix(name, "-peek") {
+			strings.Contains(name, "-view-") || strings.Contains(name, "-peek") {
 			continue
 		}
 		env, err := tmux("show-environment", "-t", name, "PCX_CONFIG")
@@ -119,7 +126,7 @@ func (s *Session) absorb(other string) {
 func (s *Session) Kill() error {
 	out, _ := tmux("list-sessions", "-F", "#{session_name}")
 	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
-		if strings.HasPrefix(name, s.cfg.Name+"-view-") || name == s.peekSession() {
+		if strings.HasPrefix(name, s.cfg.Name+"-view-") || strings.HasPrefix(name, s.cfg.Name+"-peek") {
 			tmux("kill-session", "-t", "="+name)
 		}
 	}
@@ -277,15 +284,204 @@ func (s *Session) external(t Table, wins map[string]Window) {
 // shellCmd applies the restart policy without a supervisor: the loop lives
 // inside the pane, so it keeps working when nothing is attached.
 func shellCmd(p *Proc) string {
+	var cmd string
 	switch p.Availability.Restart {
 	case "always":
 		// subshell, so an `exit` in the command cannot kill the loop
-		return fmt.Sprintf("while :; do ( %s ); sleep 1; done", p.Command)
+		cmd = fmt.Sprintf("while :; do ( %s ); sleep 1; done", p.Command)
 	case "on_failure", "on-failure":
-		return fmt.Sprintf("until ( %s ); do sleep 1; done", p.Command)
+		cmd = fmt.Sprintf("until ( %s ); do sleep 1; done", p.Command)
 	default:
-		return p.Command
+		cmd = p.Command
 	}
+	// export after the pane shell starts: macOS path_helper (in zshenv)
+	// otherwise puts /usr/bin first and the system node wins
+	return asCurrentUser(withUserPath(cmd))
+}
+
+func withUserPath(cmd string) string {
+	path := resolvedUserPath()
+	if path == "" {
+		return cmd
+	}
+	return "export PATH=" + strconv.Quote(path) + "; " + cmd
+}
+
+func resolvedUserPath() string {
+	home := ""
+	if u := invokeUser(); u != nil {
+		home = u.HomeDir
+	}
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	return userPath(home, os.Getenv("PATH"))
+}
+
+// userPath puts version-manager and user-local bins in front of PATH so
+// `node` / `npx` resolve to the account's install, not /usr/bin.
+func userPath(home, current string) string {
+	seen := map[string]bool{}
+	var out []string
+	addDir := func(dir string) {
+		if dir == "" || seen[dir] {
+			return
+		}
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			return
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	for _, dir := range userBinDirs(home) {
+		addDir(dir)
+	}
+	for _, dir := range strings.Split(current, ":") {
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return strings.Join(out, ":")
+}
+
+func userBinDirs(home string) []string {
+	nvm := os.Getenv("NVM_DIR")
+	if nvm == "" && home != "" {
+		nvm = filepath.Join(home, ".nvm")
+	}
+	fnm := os.Getenv("FNM_DIR")
+	if fnm == "" && home != "" {
+		fnm = filepath.Join(home, ".fnm")
+	}
+	return []string{
+		nvmCurrentBin(nvm),
+		os.Getenv("FNM_MULTISHELL_PATH"),
+		filepath.Join(fnm, "aliases", "default", "bin"),
+		filepath.Join(home, ".local", "share", "fnm", "aliases", "default", "bin"),
+		filepath.Join(home, ".volta", "bin"),
+		filepath.Join(home, ".asdf", "shims"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		filepath.Join(home, ".nodenv", "shims"),
+		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "share", "pnpm"),
+		filepath.Join(home, ".local", "bin"),
+		"/opt/homebrew/bin",
+	}
+}
+
+func nvmCurrentBin(nvm string) string {
+	if nvm == "" {
+		return ""
+	}
+	seen := map[string]bool{}
+	var resolve func(string, int) string
+	resolve = func(name string, depth int) string {
+		name = strings.TrimSpace(name)
+		if name == "" || depth > 8 || seen[name] {
+			return ""
+		}
+		seen[name] = true
+		p := filepath.Join(nvm, "versions", "node", name, "bin")
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			return p
+		}
+		b, err := os.ReadFile(filepath.Join(nvm, "alias", name))
+		if err != nil {
+			return ""
+		}
+		return resolve(string(b), depth+1)
+	}
+	if p := resolve("default", 0); p != "" {
+		return p
+	}
+	current := filepath.Join(nvm, "versions", "node", "current", "bin")
+	if fi, err := os.Stat(current); err == nil && fi.IsDir() {
+		return current
+	}
+	return ""
+}
+
+// asCurrentUser keeps the pane on the person who invoked pcx. A root tmux
+// server (sudo pcx) would otherwise run every command as root.
+func asCurrentUser(cmd string) string {
+	u := invokeUser()
+	if u == nil || u.Uid == strconv.Itoa(os.Geteuid()) {
+		return cmd
+	}
+	return fmt.Sprintf("sudo -u %s -H -E -- /bin/sh -c %s", strconv.Quote(u.Username), strconv.Quote(cmd))
+}
+
+func invokeUser() *user.User {
+	if os.Geteuid() == 0 {
+		if name := os.Getenv("SUDO_USER"); name != "" && name != "root" {
+			if u, err := user.Lookup(name); err == nil {
+				return u
+			}
+		}
+	}
+	u, err := user.Current()
+	if err != nil {
+		return nil
+	}
+	return u
+}
+
+// clientEnv is the invoking process's environment, minus the tmux vars that
+// would make a pane think it is the TUI client.
+func clientEnv() []string {
+	return envFlags(withResolvedPath(os.Environ()), nil)
+}
+
+func windowEnv(p *Proc) []string {
+	base := withResolvedPath(os.Environ())
+	if u := invokeUser(); u != nil && u.Uid != strconv.Itoa(os.Geteuid()) {
+		base = append(base, "HOME="+u.HomeDir, "USER="+u.Username, "LOGNAME="+u.Username)
+	}
+	return envFlags(base, p.Environment)
+}
+
+func withResolvedPath(env []string) []string {
+	path := resolvedUserPath()
+	if path == "" {
+		return env
+	}
+	out := append([]string{}, env...)
+	for i, e := range out {
+		if k, _, ok := strings.Cut(e, "="); ok && k == "PATH" {
+			out[i] = "PATH=" + path
+			return out
+		}
+	}
+	return append(out, "PATH="+path)
+}
+
+func envFlags(base, overlay []string) []string {
+	order := make([]string, 0, len(base)+len(overlay))
+	vals := map[string]string{}
+	add := func(e string) {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok || k == "TMUX" || k == "TMUX_PANE" {
+			return
+		}
+		if _, seen := vals[k]; !seen {
+			order = append(order, k)
+		}
+		vals[k] = v
+	}
+	for _, e := range base {
+		add(e)
+	}
+	for _, e := range overlay {
+		add(e)
+	}
+	out := make([]string, 0, len(order)*2)
+	for _, k := range order {
+		out = append(out, "-e", k+"="+vals[k])
+	}
+	return out
 }
 
 func (s *Session) Start(name string) string {
@@ -307,10 +503,7 @@ func (s *Session) Start(name string) string {
 		}
 		return name + ": already running"
 	}
-	env := []string{}
-	for _, e := range p.Environment {
-		env = append(env, "-e", e)
-	}
+	env := windowEnv(p)
 	cmd := shellCmd(p)
 	var err error
 	if ok { // dead window: respawn in place, keeping its position and scrollback
@@ -375,28 +568,30 @@ func (s *Session) Open(name, mode string) (*exec.Cmd, error) {
 	win := s.target() + ":" + name
 	if os.Getenv("TMUX") == "" {
 		// nothing to split or tab into: every mode collapses to attaching
-		return exec.Command("tmux", "attach-session", "-t", win, ";", "select-window", "-t", win), nil
+		ui, err := s.outputView(name)
+		if err != nil {
+			return nil, err
+		}
+		return exec.Command("tmux", "attach-session", "-t", "="+ui), nil
 	}
 	switch mode {
 	case OpenPane, OpenTab:
-		view := s.cfg.Name + "-view-" + name
-		if exec.Command("tmux", "has-session", "-t", "="+view).Run() != nil {
-			if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", view); err != nil {
-				return nil, err
-			}
-			// plain name: set-option rejects the '=' exact-match prefix
-			tmux("set-option", "-t", view, "status", "off")
-		}
-		if _, err := tmux("select-window", "-t", "="+view+":"+name); err != nil {
+		ui, err := s.outputView(name)
+		if err != nil {
 			return nil, err
 		}
 		// TMUX= lets the inner client attach; the session dies with it
-		cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null", view, view)
+		cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null; tmux kill-session -t '=%s' 2>/dev/null",
+			ui, ui, s.cfg.Name+"-view-"+name)
 		if mode == OpenPane {
-			_, err := tmux("split-window", "-h", cmd)
-			return nil, err
+			id, err := tmux("split-window", "-h", "-P", "-F", "#{pane_id}", cmd)
+			if err != nil {
+				return nil, err
+			}
+			s.peekPane = strings.TrimSpace(id)
+			return nil, nil
 		}
-		_, err := tmux("new-window", "-n", name, cmd)
+		_, err = tmux("new-window", "-n", name, cmd)
 		return nil, err
 	default:
 		_, err := tmux("switch-client", "-t", win)
@@ -404,20 +599,44 @@ func (s *Session) Open(name, mode string) (*exec.Cmd, error) {
 	}
 }
 
+// outputView is a nested attach to the process window. The attach session is
+// grouped with ours so closing the view cannot kill the process. M adds a
+// command-list pane above the output; it is hidden until then.
+func (s *Session) outputView(name string) (string, error) {
+	grouped := s.cfg.Name + "-view-" + name
+	ui := grouped + "-ui"
+	if exec.Command("tmux", "has-session", "-t", "="+grouped).Run() != nil {
+		if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", grouped); err != nil {
+			return "", err
+		}
+		tmux("set-option", "-t", grouped, "status", "off")
+	}
+	if _, err := tmux("select-window", "-t", "="+grouped+":"+name); err != nil {
+		return "", err
+	}
+	if err := s.ensureViewUI(ui, grouped); err != nil {
+		return "", err
+	}
+	return ui, nil
+}
+
 // ---------------------------------------------------------------- peek
 
 // The peek pane is one nested client on one grouped session, so following the
 // cursor is a select-window rather than a new pane per process.
-func (s *Session) peekSession() string { return s.cfg.Name + "-peek" }
+func (s *Session) peekSession() string   { return s.cfg.Name + "-peek" }
+func (s *Session) peekUISession() string { return s.cfg.Name + "-peek-ui" }
 
 func (s *Session) Peeking() bool {
-	return exec.Command("tmux", "has-session", "-t", "="+s.peekSession()).Run() == nil
+	return exec.Command("tmux", "has-session", "-t", "="+s.peekUISession()).Run() == nil
 }
 
 // Peek splits a read-only view of name's output beside the TUI, or re-points an
 // open one at name. Focus stays on the TUI (-d), so it reads as a preview.
+// The command-list pane above the output is off until M.
 func (s *Session) Peek(name string) error {
 	view := s.peekSession()
+	ui := s.peekUISession()
 	if os.Getenv("TMUX") == "" {
 		return fmt.Errorf("peek needs tmux")
 	}
@@ -428,21 +647,175 @@ func (s *Session) Peek(name string) error {
 		_, err := tmux("select-window", "-t", "="+view+":"+name)
 		return err
 	}
-	if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", view); err != nil {
-		return err
+	if exec.Command("tmux", "has-session", "-t", "="+view).Run() != nil {
+		if _, err := tmux("new-session", "-d", "-t", s.cfg.Name, "-s", view); err != nil {
+			return err
+		}
+		// plain name: set-option rejects the '=' exact-match prefix
+		tmux("set-option", "-t", view, "status", "off")
 	}
-	// plain name: set-option rejects the '=' exact-match prefix
-	tmux("set-option", "-t", view, "status", "off")
 	if _, err := tmux("select-window", "-t", "="+view+":"+name); err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null", view, view)
-	_, err := tmux("split-window", "-h", "-d", cmd)
-	return err
+	if err := s.ensureViewUI(ui, view); err != nil {
+		return err
+	}
+	cmd := fmt.Sprintf("TMUX= tmux attach -t '=%s'; tmux kill-session -t '=%s' 2>/dev/null; tmux kill-session -t '=%s' 2>/dev/null",
+		ui, ui, view)
+	id, err := tmux("split-window", "-h", "-d", "-P", "-F", "#{pane_id}", cmd)
+	if err != nil {
+		return err
+	}
+	s.peekPane = strings.TrimSpace(id)
+	return nil
 }
 
 // PeekClose drops the pane; the nested client exits with its session.
-func (s *Session) PeekClose() { tmux("kill-session", "-t", "="+s.peekSession()) }
+func (s *Session) PeekClose() {
+	s.HideCommands()
+	if s.peekPane != "" {
+		tmux("kill-pane", "-t", s.peekPane)
+		s.peekPane = ""
+	}
+	tmux("kill-session", "-t", "="+s.peekUISession())
+	tmux("kill-session", "-t", "="+s.peekSession())
+}
+
+func (s *Session) headerFile() string {
+	return filepath.Join(os.TempDir(), "pcx-header-"+sanitize(s.cfg.Name))
+}
+
+func (s *Session) writeHeader(lines []string) {
+	body := strings.Join(lines, "\n")
+	if body != "" {
+		body += "\n"
+	}
+	os.WriteFile(s.headerFile(), []byte(body), 0o644)
+}
+
+func (s *Session) headerWatch() string {
+	return fmt.Sprintf("while :; do printf '\\033[H\\033[2J'; cat %s 2>/dev/null; sleep 1; done",
+		strconv.Quote(s.headerFile()))
+}
+
+func (s *Session) outputPane() string {
+	if s.peekPane != "" {
+		return s.peekPane
+	}
+	out, err := tmux("list-panes", "-F", "#{pane_id}")
+	if err != nil {
+		return ""
+	}
+	panes := strings.Fields(out)
+	if len(panes) < 2 {
+		return ""
+	}
+	return panes[len(panes)-1]
+}
+
+func (s *Session) paneExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	return exec.Command("tmux", "display-message", "-t", id, "-p", "#{pane_id}").Run() == nil
+}
+
+// ShowCommands splits a pane above the process output with the argv tree
+// that starter actually launched.
+func (s *Session) ShowCommands(focus string) error {
+	lines := s.executedCommands(focus)
+	if len(lines) == 0 {
+		return fmt.Errorf("no executed commands")
+	}
+	s.writeHeader(lines)
+	if s.paneExists(s.cmdPane) {
+		return nil
+	}
+	target := s.outputPane()
+	if target == "" {
+		return fmt.Errorf("no output pane to split")
+	}
+	n := len(lines)
+	if n < 3 {
+		n = 3
+	}
+	if n > 12 {
+		n = 12
+	}
+	id, err := tmux("split-window", "-t", target, "-b", "-v", "-l", strconv.Itoa(n),
+		"-P", "-F", "#{pane_id}", s.headerWatch())
+	if err != nil {
+		// small peek pane: fall back to a percentage split
+		id, err = tmux("split-window", "-t", target, "-b", "-v", "-p", "30",
+			"-P", "-F", "#{pane_id}", s.headerWatch())
+		if err != nil {
+			return err
+		}
+	}
+	s.cmdPane = strings.TrimSpace(id)
+	return nil
+}
+
+// HideCommands removes the command-list pane.
+func (s *Session) HideCommands() {
+	if s.cmdPane != "" {
+		tmux("kill-pane", "-t", s.cmdPane)
+		s.cmdPane = ""
+	}
+	s.writeHeader(nil)
+}
+
+func (s *Session) RefreshCommands(focus string) {
+	if !s.paneExists(s.cmdPane) {
+		s.cmdPane = ""
+		return
+	}
+	s.writeHeader(s.executedCommands(focus))
+}
+
+// executedCommands is the live argv tree of the process that starter launched.
+func (s *Session) executedCommands(focus string) []string {
+	if focus == "" {
+		return nil
+	}
+	t := psTable()
+	wins := s.WindowsWith(t)
+	w, ok := wins[focus]
+	if !ok || w.Dead {
+		if p := s.cfg.Processes[focus]; p != nil {
+			return []string{p.Command}
+		}
+		return nil
+	}
+	return commandTree(t, w.PID, 0)
+}
+
+func commandTree(t Table, pid, depth int) []string {
+	var lines []string
+	var walk func(int, int)
+	walk = func(pid, depth int) {
+		if p, ok := t.Procs[pid]; ok {
+			lines = append(lines, strings.Repeat("  ", depth)+p.Args)
+		}
+		for _, kid := range t.Kids[pid] {
+			walk(kid, depth+1)
+		}
+	}
+	walk(pid, depth)
+	return lines
+}
+
+func (s *Session) ensureViewUI(ui, grouped string) error {
+	if exec.Command("tmux", "has-session", "-t", "="+ui).Run() == nil {
+		return nil
+	}
+	attach := fmt.Sprintf("TMUX= tmux attach -t '=%s'", grouped)
+	if _, err := tmux("new-session", "-d", "-s", ui, "-n", "view", attach); err != nil {
+		return err
+	}
+	tmux("set-option", "-t", ui, "status", "off")
+	return nil
+}
 
 // ---------------------------------------------------------------- ps
 

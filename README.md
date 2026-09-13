@@ -7,7 +7,7 @@ processes keep running when you close the TUI, and each process's real output is
 a tmux window you can jump into.
 
 ```
-go build -o pcx . && cp pcx /usr/local/bin/     # needs tmux
+go build -o pcx . && cp pcx ~/.local/bin/     # needs tmux
 ```
 
 ## Use
@@ -39,10 +39,12 @@ found by walking up from the working directory.
 |---|---|
 | `↑`/`↓`, `j`/`k`, `g`/`G` | move |
 | `space`, `enter` | expand/collapse (process trees start collapsed) |
+| `H` `L` | scroll command lines toward the start / back to the end |
 | `s` | start |
 | `x` `X` `r` | stop (TERM) · kill (KILL) · restart — each asks `[y/N]` first |
 | `l` | sneak peek: a pane on the right with the highlighted process's live output, which follows the cursor. `l` again closes it |
 | `o` | open the process's live output — then pick `p`ane, `t`ab or `w`orkspace |
+| `M` | show or hide the executed command tree above peek/output (hidden until you press it) |
 | `u` `d` | start / stop everything (`d` asks first) |
 | `y` | confirm a pending action; any other key cancels |
 | `q` | quit — processes keep running |
@@ -50,7 +52,8 @@ found by walking up from the working directory.
 On a namespace header, `s`/`x`/`r` apply to every process in it.
 
 Each process row shows status and the CPU and memory of the **whole tree** it
-spawned. Expand it to see the children, their own subtrees, and their pids.
+spawned. Expand it to see the command lines (the tail of each argv, `H`/`L` to
+scroll), children, their own subtrees, and their pids.
 
 ## One session per config
 
@@ -93,6 +96,9 @@ else (`npx`, wrapper scripts) runs under different args and will not be found.
 `l` is the quick look: one split on the right that re-points itself at whatever
 the cursor is on, so moving down the list scrubs through the output of each
 process. It needs tmux, closes with `l` again, and closes when the TUI quits.
+`M` toggles a second pane above that output listing the commands that starter
+actually launched (the live argv tree). It starts hidden; if peek is closed,
+`M` opens it first.
 
 `o` in the TUI (or `pcx attach`) shows a process's live output three ways:
 
@@ -141,7 +147,10 @@ See `examples/` for a full catalog and a demo you can run.
   window so the session survives when everything is stopped.
 - Each process is a tmux window with `remain-on-exit on`: when a process dies
   the window stays, keeping its output and exit status, and `respawn-window -k`
-  restarts it in place.
+  restarts it in place. Windows inherit the environment of the `pcx` you ran
+  (minus `TMUX*`); `sudo pcx` still runs the command as `$SUDO_USER`. `PATH`
+  prefers user-space bins (nvm, fnm, volta, Homebrew) over `/usr/bin`, so
+  `node` / `npx` are the ones from your account, not the system install.
 - Stop signals the pane's process group, then any descendant that escaped it.
 - `restart: always` is a `while :; do ( cmd ); sleep 1; done` wrapper inside the
   pane, so nothing needs to supervise it from outside.

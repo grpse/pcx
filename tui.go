@@ -60,6 +60,8 @@ type model struct {
 	status   string
 	asking   *ask
 	peek     bool
+	cmdOff   int  // characters shifted from the tail of command lines (0 = show the end)
+	showCmds bool // M: command-list pane above peek/output
 }
 
 func newModel(cfg *Config, s *Session) model {
@@ -93,7 +95,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(refresh(m.sess), tick())
 	case refreshMsg:
 		m.wins, m.table, m.peek = msg.wins, msg.table, msg.peek
+		if !m.peek {
+			m.showCmds = false
+		}
 		m.build()
+		if m.showCmds {
+			m.sess.RefreshCommands(m.row().proc)
+		}
 	case statusMsg:
 		m.status = string(msg)
 	case tea.KeyMsg:
@@ -139,6 +147,38 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "left", "h":
 		m.expanded[cur.key] = false
 		m.build()
+	case "H": // command lines default to the tail; H/L scroll toward start/end
+		m.cmdOff++
+		m.build()
+	case "L":
+		if m.cmdOff > 0 {
+			m.cmdOff--
+		}
+		m.build()
+	case "M": // command list above the output; off until pressed
+		if m.showCmds {
+			m.sess.HideCommands()
+			m.showCmds = false
+			m.status = "commands hidden"
+			break
+		}
+		if cur.proc == "" {
+			m.status = "M: put the cursor on a process"
+			break
+		}
+		if !m.peek {
+			if err := m.sess.Peek(cur.proc); err != nil {
+				m.status = cur.proc + ": " + err.Error()
+				break
+			}
+			m.peek = true
+		}
+		if err := m.sess.ShowCommands(cur.proc); err != nil {
+			m.status = "M: " + err.Error()
+			break
+		}
+		m.showCmds = true
+		m.status = "commands"
 	case "s":
 		m = m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) })
 		m.follow(cur.proc) // peek at what we just started
@@ -158,6 +198,7 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.peek:
 			m.sess.PeekClose()
 			m.peek = false
+			m.showCmds = false
 			m.status = "peek closed"
 		case cur.proc == "":
 			m.status = "peek: put the cursor on a process"
@@ -207,6 +248,9 @@ func (m *model) follow(proc string) {
 	}
 	if err := m.sess.Peek(proc); err != nil {
 		m.status = proc + ": " + err.Error()
+	}
+	if m.showCmds {
+		m.sess.RefreshCommands(proc)
 	}
 }
 
@@ -303,35 +347,40 @@ func (m *model) build() {
 		for _, p := range byNS[ns] {
 			key := "proc:" + p.Name
 			w, live := m.wins[p.Name]
-			hasKids := live && !w.Dead && len(m.table.Kids[w.PID]) > 0
+			hasTree := live && !w.Dead
 			m.rows = append(m.rows, row{
-				key: key, proc: p.Name, leaf: !hasKids,
-				text: "  " + arrowIf(hasKids, m.expanded[key]) + " " + m.procLine(p),
+				key: key, proc: p.Name, leaf: !hasTree,
+				text: "  " + arrowIf(hasTree, m.expanded[key]) + " " + m.procLine(p),
 			})
-			if hasKids && m.expanded[key] {
-				m.addKids(w.PID, 2, p.Name)
+			if hasTree && m.expanded[key] {
+				m.addNode(w.PID, 2, p.Name)
 			}
 		}
 	}
 	m.cursor = clamp(m.cursor, 0, len(m.rows)-1)
 }
 
-func (m *model) addKids(pid, depth int, proc string) {
-	for _, kid := range m.table.Kids[pid] {
-		info := m.table.Procs[kid]
-		cpu, rss := totals(m.table, kid)
-		key := fmt.Sprintf("pid:%d", kid)
-		hasKids := len(m.table.Kids[kid]) > 0
-		// 36 keeps a first-level child's stats under the parent's columns
-		args := trunc(info.Args, 36)
-		m.rows = append(m.rows, row{
-			key: key, proc: proc, leaf: !hasKids,
-			text: strings.Repeat("  ", depth) + arrowIf(hasKids, m.expanded[key]) + " " +
-				dim.Render(fmt.Sprintf("%-36s", args)) +
-				dim.Render(fmt.Sprintf("%6.1f%% %9s  %d", cpu, human(rss), kid)),
-		})
-		if hasKids && m.expanded[key] {
-			m.addKids(kid, depth+1, proc)
+func (m *model) addNode(pid, depth int, proc string) {
+	info := m.table.Procs[pid]
+	cpu, rss := totals(m.table, pid)
+	key := fmt.Sprintf("pid:%d", pid)
+	hasKids := len(m.table.Kids[pid]) > 0
+	indent := 2 * depth
+	// stats sit at the right; the rest of the row is the command, tail-aligned
+	stats := fmt.Sprintf("%6.1f%% %9s  %d", cpu, human(rss), pid)
+	cmdW := m.width - indent - 2 - len(stats) - 2
+	if cmdW < 16 {
+		cmdW = 16
+	}
+	args := visCmd(info.Args, cmdW, m.cmdOff)
+	m.rows = append(m.rows, row{
+		key: key, proc: proc, leaf: !hasKids,
+		text: strings.Repeat("  ", depth) + arrowIf(hasKids, m.expanded[key]) + " " +
+			dim.Render(args) + dim.Render(stats),
+	})
+	if hasKids && m.expanded[key] {
+		for _, kid := range m.table.Kids[pid] {
+			m.addNode(kid, depth+1, proc)
 		}
 	}
 }
@@ -388,7 +437,7 @@ func (m model) View() string {
 	for i := len(m.rows) - off; i < body; i++ {
 		b.WriteString("\n")
 	}
-	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · l peek · o output · u/d all · space expand · q quit") + "\n")
+	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · l peek · o output · M commands · H/L scroll cmd · u/d all · space expand · q quit") + "\n")
 	switch {
 	case m.asking != nil:
 		style := bold
@@ -421,6 +470,38 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+// visCmd is the command-column viewport: by default the tail (the flags and
+// the thing that actually ran), H/L shift toward the start or back to the end.
+func visCmd(s string, width, fromEnd int) string {
+	if width < 1 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= width {
+		return string(r) + strings.Repeat(" ", width-len(r))
+	}
+	if fromEnd < 0 {
+		fromEnd = 0
+	}
+	start := len(r) - width - fromEnd
+	if start < 0 {
+		start = 0
+	}
+	end := start + width
+	if end > len(r) {
+		end = len(r)
+		start = end - width
+	}
+	chunk := append([]rune{}, r[start:end]...)
+	if start > 0 {
+		chunk[0] = '…'
+	}
+	if end < len(r) {
+		chunk[len(chunk)-1] = '…'
+	}
+	return string(chunk)
 }
 
 func clamp(v, lo, hi int) int {
