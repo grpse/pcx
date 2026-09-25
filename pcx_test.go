@@ -56,10 +56,37 @@ processes:
 		t.Fatal("disabled not parsed")
 	}
 	// the subshell matters: without it an `exit` in the command kills the loop
-	if got := shellCmd(&Proc{Command: "x", Availability: struct {
+	if got := shellCommand(&Proc{Command: "x", Availability: struct {
 		Restart string `yaml:"restart"`
-	}{Restart: "always"}}); !strings.Contains(got, "while :;") || !strings.Contains(got, "( x )") {
+	}{Restart: "always"}}, "/bin/sh", "/usr/bin:/bin"); !strings.Contains(got, "while :;") || !strings.Contains(got, "( x )") {
 		t.Fatalf("restart policy not wrapped: %q", got)
+	}
+}
+
+func TestShellCommandUsesSelectedShellSyntax(t *testing.T) {
+	posix := shellCommand(&Proc{Command: "echo 'hello'", Availability: struct {
+		Restart string `yaml:"restart"`
+	}{Restart: "on_failure"}}, "/bin/zsh", "/custom/bin:/usr/bin")
+	if !strings.HasPrefix(posix, "exec '/bin/zsh' -l -c ") ||
+		!strings.Contains(posix, "/custom/bin:/usr/bin") ||
+		!strings.Contains(posix, "until ( echo") {
+		t.Fatalf("zsh command did not use POSIX shell environment: %q", posix)
+	}
+
+	fish := shellCommand(&Proc{Command: "echo 'hello'", Availability: struct {
+		Restart string `yaml:"restart"`
+	}{Restart: "on_failure"}}, "/opt/homebrew/bin/fish", "/custom/bin:/usr/bin")
+	if !strings.HasPrefix(fish, "exec '/opt/homebrew/bin/fish' -l -c ") ||
+		!strings.Contains(fish, "set -gx PATH") ||
+		!strings.Contains(fish, "while not") ||
+		!strings.Contains(fish, "/opt/homebrew/bin/fish") {
+		t.Fatalf("fish command did not use fish syntax: %q", fish)
+	}
+
+	quoted := shellQuote("it's safe")
+	out, err := exec.Command("/bin/sh", "-c", "printf %s "+quoted).Output()
+	if err != nil || string(out) != "it's safe" {
+		t.Fatalf("shell quoting failed: output=%q err=%v quote=%q", out, err, quoted)
 	}
 }
 
@@ -292,8 +319,13 @@ processes:
 	}
 
 	press := func(m model, key string) model {
-		next, _ := m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		return next.(model)
+		next, cmd := m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		m = next.(model)
+		for cmd != nil {
+			next, cmd = m.Update(cmd())
+			m = next.(model)
+		}
+		return m
 	}
 	alive := func() bool { w, ok := s.Windows()["spawner"]; return ok && !w.Dead }
 
@@ -316,6 +348,86 @@ processes:
 		t.Fatal("y should clear the prompt")
 	}
 	waitFor(t, s, func(w Window) bool { return w.Dead })
+}
+
+func TestTUIActionsRunInKeypressOrder(t *testing.T) {
+	cfg := &Config{
+		Name:      "pcx-test-action-queue",
+		Processes: map[string]*Proc{},
+	}
+	m := newModel(cfg, NewSession(cfg))
+	var order []string
+
+	first, firstCmd := m.enqueue(queuedAction{run: func() string {
+		order = append(order, "first")
+		return "first done"
+	}})
+	m = first.(model)
+	second, secondCmd := m.enqueue(queuedAction{run: func() string {
+		order = append(order, "second")
+		return "second done"
+	}})
+	m = second.(model)
+	if firstCmd == nil || secondCmd != nil {
+		t.Fatal("the first action should start and the second should wait")
+	}
+
+	next, nextCmd := m.Update(firstCmd())
+	m = next.(model)
+	if nextCmd == nil || strings.Join(order, ",") != "first" {
+		t.Fatalf("second action started before the first completed: %v", order)
+	}
+	next, nextCmd = m.Update(nextCmd())
+	m = next.(model)
+	if nextCmd != nil || m.running || strings.Join(order, ",") != "first,second" {
+		t.Fatalf("actions did not drain in order: %v", order)
+	}
+}
+
+func TestSessionManagerOwnsAndRecoversItsExecutionContext(t *testing.T) {
+	cfg := &Config{Name: "pcx-test-manager", Processes: map[string]*Proc{}}
+	s := NewSession(cfg)
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+
+	go func() {
+		_, _ = sessionCall(s, func() struct{} {
+			close(firstEntered)
+			<-releaseFirst
+			return struct{}{}
+		})
+		close(firstDone)
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		_, _ = sessionCall(s, func() struct{} {
+			close(secondEntered)
+			return struct{}{}
+		})
+		close(secondDone)
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("a second request entered while the first was still executing")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+
+	if _, err := sessionCall(s, func() struct{} {
+		panic("test panic")
+	}); err == nil || !strings.Contains(err.Error(), "recovered from panic") {
+		t.Fatalf("manager did not contain its worker panic: %v", err)
+	}
+	value, err := sessionCall(s, func() int { return 42 })
+	if err != nil || value != 42 {
+		t.Fatalf("manager did not continue after recovery: value=%d err=%v", value, err)
+	}
 }
 
 // Identity follows the file's contents, and an edit must not orphan what is

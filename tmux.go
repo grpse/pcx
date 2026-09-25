@@ -7,9 +7,11 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // holder is an idle shell window that keeps the session alive when every
@@ -17,12 +19,113 @@ import (
 const holder = "__pcx"
 
 type Session struct {
-	cfg      *Config
-	peekPane string // the output pane beside the TUI (#{pane_id})
-	cmdPane  string // M's command-list pane above it
+	cfg        *Config
+	peekPane   string // the output pane beside the TUI (#{pane_id})
+	cmdPane    string // M's command-list pane above it
+	debugPane  string // D's internal diagnostics pane below the TUI
+	debugFile  *os.File
+	clientPane string
+	requests   chan managerRequest
 }
 
-func NewSession(c *Config) *Session { return &Session{cfg: c} }
+type managerRequest struct {
+	name string
+	run  func()
+	done chan error
+}
+
+func NewSession(c *Config) *Session {
+	debugPath := filepath.Join(os.TempDir(), fmt.Sprintf("pcx-debug-%s-%d.log", sanitize(c.Name), os.Getpid()))
+	_ = os.Remove(debugPath)
+	debugFile, _ := os.OpenFile(debugPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	// The buffer lets producers enqueue while a command is running. The single
+	// consumer below remains the only execution context for manager work.
+	s := &Session{
+		cfg:        c,
+		requests:   make(chan managerRequest, 256),
+		debugFile:  debugFile,
+		clientPane: os.Getenv("TMUX_PANE"),
+	}
+	s.debugf("manager created shell=%s client_pane=%s", executionShell(), s.clientPane)
+	go s.manage()
+	return s
+}
+
+// manage is the only goroutine that communicates with tmux and the process
+// table for this session. Callers submit work and wait for its result, so a
+// second command can never enter halfway through the first one's transaction.
+func (s *Session) manage() {
+	for req := range s.requests {
+		var err error
+		started := time.Now()
+		s.debugf("start %s queued=%d", req.name, len(s.requests))
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					err = fmt.Errorf("process manager recovered from panic: %v", v)
+				}
+			}()
+			req.run()
+		}()
+		s.debugf("done  %s duration=%s error=%v", req.name, time.Since(started).Round(time.Millisecond), err)
+		req.done <- err
+	}
+}
+
+func sessionCall[T any](s *Session, fn func() T) (result T, err error) {
+	done := make(chan error, 1)
+	name := managerCaller()
+	s.debugf("queue %s queued=%d", name, len(s.requests))
+	s.requests <- managerRequest{
+		name: name,
+		run:  func() { result = fn() },
+		done: done,
+	}
+	err = <-done
+	s.debugf("result %s %s", name, debugResult(result))
+	return
+}
+
+func managerCaller() string {
+	pc, _, _, ok := runtime.Caller(2)
+	if !ok {
+		return "unknown"
+	}
+	name := runtime.FuncForPC(pc).Name()
+	if at := strings.LastIndex(name, "."); at >= 0 {
+		name = name[at+1:]
+	}
+	return name
+}
+
+func debugResult(v any) string {
+	switch value := v.(type) {
+	case Snapshot:
+		return fmt.Sprintf("windows=%d processes=%d peeking=%t", len(value.Windows), len(value.Table.Procs), value.Peeking)
+	case map[string]Window:
+		return fmt.Sprintf("windows=%d", len(value))
+	}
+	text := fmt.Sprintf("%v", v)
+	if len(text) > 500 {
+		text = text[:499] + "…"
+	}
+	return text
+}
+
+func (s *Session) debugf(format string, args ...any) {
+	if s.debugFile == nil {
+		return
+	}
+	line := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintf(s.debugFile, "%s %s\n", time.Now().Format("15:04:05.000"), line)
+}
+
+func (s *Session) debugPath() string {
+	if s.debugFile == nil {
+		return ""
+	}
+	return s.debugFile.Name()
+}
 
 func (s *Session) target() string { return "=" + s.cfg.Name }
 
@@ -35,12 +138,32 @@ func tmux(args ...string) (string, error) {
 }
 
 func (s *Session) Exists() bool {
+	v, _ := sessionCall(s, s.exists)
+	return v
+}
+
+func (s *Session) exists() bool {
 	return exec.Command("tmux", "has-session", "-t", s.target()).Run() == nil
 }
 
 // Ensure creates the session if needed; reports whether it created it.
 func (s *Session) Ensure() (bool, error) {
-	if s.Exists() {
+	type result struct {
+		created bool
+		err     error
+	}
+	v, managerErr := sessionCall(s, func() result {
+		created, err := s.ensure()
+		return result{created, err}
+	})
+	if managerErr != nil {
+		return false, managerErr
+	}
+	return v.created, v.err
+}
+
+func (s *Session) ensure() (bool, error) {
+	if s.exists() {
 		return false, nil
 	}
 	args := append([]string{"new-session", "-d", "-s", s.cfg.Name, "-n", holder}, clientEnv()...)
@@ -85,11 +208,18 @@ func (s *Session) configSessions() []string {
 // pcx running the same file. Without it an edit would orphan running processes
 // and a second pcx would start a duplicate of each command.
 func (s *Session) Adopt() {
+	_, _ = sessionCall(s, func() struct{} {
+		s.adopt()
+		return struct{}{}
+	})
+}
+
+func (s *Session) adopt() {
 	others := s.configSessions()
 	if len(others) == 0 {
 		return
 	}
-	if !s.Exists() {
+	if !s.exists() {
 		tmux("rename-session", "-t", others[0], s.cfg.Name)
 		others = others[1:]
 	}
@@ -124,13 +254,21 @@ func (s *Session) absorb(other string) {
 // Kill destroys the session and any view sessions grouped with it. Views share
 // the windows, so leaving one alive would keep the processes alive too.
 func (s *Session) Kill() error {
+	err, managerErr := sessionCall(s, s.kill)
+	if managerErr != nil {
+		return managerErr
+	}
+	return err
+}
+
+func (s *Session) kill() error {
 	out, _ := tmux("list-sessions", "-F", "#{session_name}")
 	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.HasPrefix(name, s.cfg.Name+"-view-") || strings.HasPrefix(name, s.cfg.Name+"-peek") {
 			tmux("kill-session", "-t", "="+name)
 		}
 	}
-	if !s.Exists() {
+	if !s.exists() {
 		return nil
 	}
 	_, err := tmux("kill-session", "-t", s.target())
@@ -144,6 +282,29 @@ type Window struct {
 	ExitCode int    // -1 when unknown
 	Signal   string // signal name that killed the pane ("term"), empty when none
 	External bool   // running outside our session; no tmux window behind it
+}
+
+type Snapshot struct {
+	Windows map[string]Window
+	Table   Table
+	Peeking bool
+}
+
+func (s *Session) Snapshot() Snapshot {
+	v, err := sessionCall(s, s.snapshot)
+	if err != nil {
+		return Snapshot{Windows: map[string]Window{}, Table: Table{Procs: map[int]PS{}, Kids: map[int][]int{}}}
+	}
+	return v
+}
+
+func (s *Session) snapshot() Snapshot {
+	table := psTable()
+	return Snapshot{
+		Windows: s.windowsWith(table),
+		Table:   table,
+		Peeking: s.peeking(),
+	}
 }
 
 // Status is the one-word state shown by both the CLI and the TUI.
@@ -162,13 +323,27 @@ func (w Window) Status() string {
 	}
 }
 
-func (s *Session) Windows() map[string]Window { return s.WindowsWith(psTable()) }
+func (s *Session) Windows() map[string]Window {
+	wins, err := sessionCall(s, func() map[string]Window { return s.windowsWith(psTable()) })
+	if err != nil {
+		return map[string]Window{}
+	}
+	return wins
+}
 
 // WindowsWith takes the ps sweep from the caller, so a refresh that already has
 // one does not run a second.
 func (s *Session) WindowsWith(t Table) map[string]Window {
+	wins, err := sessionCall(s, func() map[string]Window { return s.windowsWith(t) })
+	if err != nil {
+		return map[string]Window{}
+	}
+	return wins
+}
+
+func (s *Session) windowsWith(t Table) map[string]Window {
 	wins := map[string]Window{}
-	if s.Exists() {
+	if s.exists() {
 		wins = listWindows(s.target())
 		if s.pull(wins) {
 			wins = listWindows(s.target())
@@ -284,27 +459,52 @@ func (s *Session) external(t Table, wins map[string]Window) {
 // shellCmd applies the restart policy without a supervisor: the loop lives
 // inside the pane, so it keeps working when nothing is attached.
 func shellCmd(p *Proc) string {
-	var cmd string
-	switch p.Availability.Restart {
-	case "always":
-		// subshell, so an `exit` in the command cannot kill the loop
-		cmd = fmt.Sprintf("while :; do ( %s ); sleep 1; done", p.Command)
-	case "on_failure", "on-failure":
-		cmd = fmt.Sprintf("until ( %s ); do sleep 1; done", p.Command)
-	default:
-		cmd = p.Command
-	}
-	// Re-export after the pane shell starts so path_helper cannot put
-	// /usr/bin ahead of the account's own bins.
-	return asCurrentUser(withUserPath(cmd))
+	shell := executionShell()
+	return asCurrentUser(shellCommand(p, shell, resolvedUserPath()))
 }
 
-func withUserPath(cmd string) string {
-	path := resolvedUserPath()
+func shellCommand(p *Proc, shell, path string) string {
+	var script string
+	if filepath.Base(shell) == "fish" {
+		run := shellQuote(shell) + " -l -c " + shellQuote(p.Command)
+		switch p.Availability.Restart {
+		case "always":
+			script = fmt.Sprintf("while true; %s; sleep 1; end", run)
+		case "on_failure", "on-failure":
+			script = fmt.Sprintf("while not %s; sleep 1; end", run)
+		default:
+			script = p.Command
+		}
+	} else {
+		switch p.Availability.Restart {
+		case "always":
+			// subshell, so an `exit` in the command cannot kill the loop
+			script = fmt.Sprintf("while :; do ( %s ); sleep 1; done", p.Command)
+		case "on_failure", "on-failure":
+			script = fmt.Sprintf("until ( %s ); do sleep 1; done", p.Command)
+		default:
+			script = p.Command
+		}
+	}
+	// Start the same kind of login/interactive shell that invoked pcx. PATH is
+	// re-exported inside it so profile setup such as path_helper cannot put
+	// /usr/bin ahead of the account's own bins.
+	script = withUserPath(script, shell, path)
+	return "exec " + shellQuote(shell) + " -l -c " + shellQuote(script)
+}
+
+func withUserPath(cmd, shell, path string) string {
 	if path == "" {
 		return cmd
 	}
-	return "export PATH=" + strconv.Quote(path) + "; " + cmd
+	if filepath.Base(shell) == "fish" {
+		dirs := strings.Split(path, ":")
+		for i, dir := range dirs {
+			dirs[i] = shellQuote(dir)
+		}
+		return "set -gx PATH " + strings.Join(dirs, " ") + "; " + cmd
+	}
+	return "export PATH=" + shellQuote(path) + "; " + cmd
 }
 
 func resolvedUserPath() string {
@@ -360,15 +560,75 @@ func userBinDirs(home string) []string {
 }
 
 func userShellPath() string {
-	sh := os.Getenv("SHELL")
-	if sh == "" {
-		return ""
+	shell := executionShell()
+	printPath := `printf '\n__PCX_PATH__%s\n' "$PATH"`
+	if filepath.Base(shell) == "fish" {
+		printPath = `printf '\n__PCX_PATH__%s\n' (string join : $PATH)`
 	}
-	out, err := exec.Command(sh, "-lic", `printf %s "$PATH"`).Output()
+	out, err := exec.Command(shell, "-l", "-c", printPath).Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	const marker = "__PCX_PATH__"
+	text := string(out)
+	at := strings.LastIndex(text, marker)
+	if at < 0 {
+		return ""
+	}
+	path := text[at+len(marker):]
+	if end := strings.IndexByte(path, '\n'); end >= 0 {
+		path = path[:end]
+	}
+	return strings.TrimSpace(path)
+}
+
+// executionShell finds the shell that launched pcx rather than assuming that
+// $SHELL still describes the current process. Wrappers such as sudo can sit
+// between them, so walk the complete parent chain before falling back.
+func executionShell() string {
+	table := psTable()
+	for pid, seen := os.Getppid(), map[int]bool{}; pid > 1 && !seen[pid]; {
+		seen[pid] = true
+		if p, ok := table.Procs[pid]; ok {
+			if sh := supportedShell(strings.Fields(p.Args)); sh != "" {
+				return sh
+			}
+			pid = p.PPID
+			continue
+		}
+		break
+	}
+	if sh := supportedShell([]string{os.Getenv("SHELL")}); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
+func supportedShell(argv []string) string {
+	if len(argv) == 0 || argv[0] == "" {
+		return ""
+	}
+	candidate := strings.TrimPrefix(argv[0], "-")
+	switch filepath.Base(candidate) {
+	case "bash", "zsh", "sh", "dash", "ash", "ksh", "mksh", "fish":
+	default:
+		return ""
+	}
+	if filepath.IsAbs(candidate) {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+		return ""
+	}
+	path, err := exec.LookPath(candidate)
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // asCurrentUser keeps the pane on the person who invoked pcx. A root tmux
@@ -378,7 +638,7 @@ func asCurrentUser(cmd string) string {
 	if u == nil || u.Uid == strconv.Itoa(os.Geteuid()) {
 		return cmd
 	}
-	return fmt.Sprintf("sudo -u %s -H -E -- /bin/sh -c %s", strconv.Quote(u.Username), strconv.Quote(cmd))
+	return fmt.Sprintf("sudo -u %s -H -E -- /bin/sh -c %s", shellQuote(u.Username), shellQuote(cmd))
 }
 
 func invokeUser() *user.User {
@@ -452,15 +712,23 @@ func envFlags(base, overlay []string) []string {
 }
 
 func (s *Session) Start(name string) string {
+	msg, err := sessionCall(s, func() string { return s.start(name) })
+	if err != nil {
+		return name + ": " + err.Error()
+	}
+	return msg
+}
+
+func (s *Session) start(name string) string {
 	p := s.cfg.Processes[name]
 	if p == nil {
 		return name + ": unknown process"
 	}
-	if _, err := s.Ensure(); err != nil {
+	if _, err := s.ensure(); err != nil {
 		return name + ": " + err.Error()
 	}
-	before := listWindows(s.target()) // to tell an adoption from a plain no-op
-	w, ok := s.Windows()[name]        // absorbs another pcx's window for this config
+	before := listWindows(s.target())       // to tell an adoption from a plain no-op
+	w, ok := s.windowsWith(psTable())[name] // absorbs another pcx's window for this config
 	if ok && w.External {
 		return fmt.Sprintf("%s: already running outside pcx (pid %d)", name, w.PID)
 	}
@@ -491,7 +759,15 @@ func (s *Session) Start(name string) string {
 }
 
 func (s *Session) Stop(name string, sig syscall.Signal) string {
-	w, ok := s.Windows()[name]
+	msg, err := sessionCall(s, func() string { return s.stop(name, sig) })
+	if err != nil {
+		return name + ": " + err.Error()
+	}
+	return msg
+}
+
+func (s *Session) stop(name string, sig syscall.Signal) string {
+	w, ok := s.windowsWith(psTable())[name]
 	if !ok || w.Dead {
 		return name + ": not running"
 	}
@@ -511,8 +787,16 @@ func (s *Session) Stop(name string, sig syscall.Signal) string {
 }
 
 func (s *Session) Restart(name string) string {
-	s.Stop(name, syscall.SIGTERM)
-	return s.Start(name) // respawn -k finishes off whatever survived
+	msg, err := sessionCall(s, func() string { return s.restart(name) })
+	if err != nil {
+		return name + ": " + err.Error()
+	}
+	return msg
+}
+
+func (s *Session) restart(name string) string {
+	s.stop(name, syscall.SIGTERM)
+	return s.start(name) // respawn -k finishes off whatever survived
 }
 
 // Open modes for a process's live output.
@@ -532,6 +816,21 @@ var OpenModes = []string{OpenPane, OpenTab, OpenWorkspace}
 // process keeps its own window: closing the view cannot kill the process, which
 // linking the real window into the user's session would risk.
 func (s *Session) Open(name, mode string) (*exec.Cmd, error) {
+	type result struct {
+		cmd *exec.Cmd
+		err error
+	}
+	v, managerErr := sessionCall(s, func() result {
+		cmd, err := s.open(name, mode)
+		return result{cmd, err}
+	})
+	if managerErr != nil {
+		return nil, managerErr
+	}
+	return v.cmd, v.err
+}
+
+func (s *Session) open(name, mode string) (*exec.Cmd, error) {
 	win := s.target() + ":" + name
 	if os.Getenv("TMUX") == "" {
 		// nothing to split or tab into: every mode collapses to attaching
@@ -595,6 +894,11 @@ func (s *Session) peekSession() string   { return s.cfg.Name + "-peek" }
 func (s *Session) peekUISession() string { return s.cfg.Name + "-peek-ui" }
 
 func (s *Session) Peeking() bool {
+	v, _ := sessionCall(s, s.peeking)
+	return v
+}
+
+func (s *Session) peeking() bool {
 	return exec.Command("tmux", "has-session", "-t", "="+s.peekUISession()).Run() == nil
 }
 
@@ -602,15 +906,23 @@ func (s *Session) Peeking() bool {
 // open one at name. Focus stays on the TUI (-d), so it reads as a preview.
 // The command-list pane above the output is off until M.
 func (s *Session) Peek(name string) error {
+	err, managerErr := sessionCall(s, func() error { return s.peek(name) })
+	if managerErr != nil {
+		return managerErr
+	}
+	return err
+}
+
+func (s *Session) peek(name string) error {
 	view := s.peekSession()
 	ui := s.peekUISession()
 	if os.Getenv("TMUX") == "" {
 		return fmt.Errorf("peek needs tmux")
 	}
-	if w, ok := s.Windows()[name]; !ok || w.External {
+	if w, ok := s.windowsWith(psTable())[name]; !ok || w.External {
 		return fmt.Errorf("no tmux output — not started by pcx")
 	}
-	if s.Peeking() {
+	if s.peeking() {
 		_, err := tmux("select-window", "-t", "="+view+":"+name)
 		return err
 	}
@@ -639,7 +951,14 @@ func (s *Session) Peek(name string) error {
 
 // PeekClose drops the pane; the nested client exits with its session.
 func (s *Session) PeekClose() {
-	s.HideCommands()
+	_, _ = sessionCall(s, func() struct{} {
+		s.peekClose()
+		return struct{}{}
+	})
+}
+
+func (s *Session) peekClose() {
+	s.hideCommands()
 	if s.peekPane != "" {
 		tmux("kill-pane", "-t", s.peekPane)
 		s.peekPane = ""
@@ -690,6 +1009,14 @@ func (s *Session) paneExists(id string) bool {
 // ShowCommands splits a pane above the process output with the argv tree
 // that starter actually launched.
 func (s *Session) ShowCommands(focus string) error {
+	err, managerErr := sessionCall(s, func() error { return s.showCommands(focus) })
+	if managerErr != nil {
+		return managerErr
+	}
+	return err
+}
+
+func (s *Session) showCommands(focus string) error {
 	lines := s.executedCommands(focus)
 	if len(lines) == 0 {
 		return fmt.Errorf("no executed commands")
@@ -725,6 +1052,13 @@ func (s *Session) ShowCommands(focus string) error {
 
 // HideCommands removes the command-list pane.
 func (s *Session) HideCommands() {
+	_, _ = sessionCall(s, func() struct{} {
+		s.hideCommands()
+		return struct{}{}
+	})
+}
+
+func (s *Session) hideCommands() {
 	if s.cmdPane != "" {
 		tmux("kill-pane", "-t", s.cmdPane)
 		s.cmdPane = ""
@@ -733,6 +1067,13 @@ func (s *Session) HideCommands() {
 }
 
 func (s *Session) RefreshCommands(focus string) {
+	_, _ = sessionCall(s, func() struct{} {
+		s.refreshCommands(focus)
+		return struct{}{}
+	})
+}
+
+func (s *Session) refreshCommands(focus string) {
 	if !s.paneExists(s.cmdPane) {
 		s.cmdPane = ""
 		return
@@ -746,7 +1087,7 @@ func (s *Session) executedCommands(focus string) []string {
 		return nil
 	}
 	t := psTable()
-	wins := s.WindowsWith(t)
+	wins := s.windowsWith(t)
 	w, ok := wins[focus]
 	if !ok || w.Dead {
 		if p := s.cfg.Processes[focus]; p != nil {
@@ -782,6 +1123,62 @@ func (s *Session) ensureViewUI(ui, grouped string) error {
 	}
 	tmux("set-option", "-t", ui, "status", "off")
 	return nil
+}
+
+// ---------------------------------------------------------------- debug
+
+// ToggleDebug opens or closes a pane below the TUI that follows the process
+// manager's internal request log.
+func (s *Session) ToggleDebug() (bool, error) {
+	type result struct {
+		open bool
+		err  error
+	}
+	v, managerErr := sessionCall(s, func() result {
+		open, err := s.toggleDebug()
+		return result{open, err}
+	})
+	if managerErr != nil {
+		return false, managerErr
+	}
+	return v.open, v.err
+}
+
+func (s *Session) toggleDebug() (bool, error) {
+	if s.paneExists(s.debugPane) {
+		s.debugClose()
+		return false, nil
+	}
+	if s.clientPane == "" {
+		return false, fmt.Errorf("debug pane needs pcx to run inside tmux")
+	}
+	if s.debugPath() == "" {
+		return false, fmt.Errorf("debug log is unavailable")
+	}
+	s.debugf("opening debug pane")
+	command := "exec tail -n 200 -f " + shellQuote(s.debugPath())
+	id, err := tmux("split-window", "-v", "-d", "-p", "30", "-t", s.clientPane,
+		"-P", "-F", "#{pane_id}", command)
+	if err != nil {
+		return false, err
+	}
+	s.debugPane = strings.TrimSpace(id)
+	return true, nil
+}
+
+func (s *Session) DebugClose() {
+	_, _ = sessionCall(s, func() struct{} {
+		s.debugClose()
+		return struct{}{}
+	})
+}
+
+func (s *Session) debugClose() {
+	if s.paneExists(s.debugPane) {
+		tmux("kill-pane", "-t", s.debugPane)
+	}
+	s.debugPane = ""
+	s.debugf("debug pane closed")
 }
 
 // ---------------------------------------------------------------- ps
@@ -847,6 +1244,21 @@ func totals(t Table, pid int) (cpu float64, rss int) {
 
 // Logs returns a process's scrollback without tmux's blank pane padding.
 func (s *Session) Logs(name string, lines int) (string, error) {
+	type result struct {
+		logs string
+		err  error
+	}
+	v, managerErr := sessionCall(s, func() result {
+		logs, err := s.logs(name, lines)
+		return result{logs, err}
+	})
+	if managerErr != nil {
+		return "", managerErr
+	}
+	return v.logs, v.err
+}
+
+func (s *Session) logs(name string, lines int) (string, error) {
 	out, err := tmux("capture-pane", "-p", "-S", fmt.Sprintf("-%d", lines), "-t", s.target()+":"+name)
 	if err != nil {
 		return "", err

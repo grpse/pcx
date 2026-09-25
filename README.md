@@ -6,9 +6,31 @@ tmux does the supervising — one detached session, one window per process — s
 processes keep running when you close the TUI, and each process's real output is
 a tmux window you can jump into.
 
+```sh
+bash ./install.sh     # builds pcx into ~/.local/bin; needs tmux
 ```
-go build -o pcx . && cp pcx ~/.local/bin/     # needs tmux
+
+Using `bash` works even when a downloaded copy of `install.sh` is not marked
+executable. To run it directly instead:
+
+```sh
+chmod +x install.sh
+./install.sh
 ```
+
+### macOS security
+
+The installer removes Gatekeeper's quarantine attribute from the `pcx` binary
+that it builds locally. If macOS still says that Apple cannot verify the
+developer, run:
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/pcx
+```
+
+Alternatively, try to run `pcx`, then open **System Settings → Privacy &
+Security** and choose **Open Anyway**. Only bypass Gatekeeper when you trust the
+source you built.
 
 ## Use
 
@@ -45,6 +67,7 @@ found by walking up from the working directory.
 | `l` | sneak peek: a pane on the right with the highlighted process's live output, which follows the cursor. `l` again closes it |
 | `o` | open the process's live output — then pick `p`ane, `t`ab or `w`orkspace |
 | `M` | show or hide the executed command tree above peek/output (hidden until you press it) |
+| `D` | show or hide internal process-manager diagnostics in a pane below the TUI |
 | `u` `d` | start / stop everything (`d` asks first) |
 | `y` | confirm a pending action; any other key cancels |
 | `q` | quit — processes keep running |
@@ -100,6 +123,11 @@ process. It needs tmux, closes with `l` again, and closes when the TUI quits.
 actually launched (the live argv tree). It starts hidden; if peek is closed,
 `M` opens it first.
 
+`D` opens a diagnostic pane below the TUI. It follows the internal manager log,
+including queued operations, execution order, duration, summarized results,
+errors, and recovered panics. Press `D` again to close it; quitting pcx also
+closes the pane.
+
 `o` in the TUI (or `pcx attach`) shows a process's live output three ways:
 
 - **pane** — splits the current tmux window beside the TUI
@@ -148,12 +176,14 @@ See `examples/` for a full catalog and a demo you can run.
 - Each process is a tmux window with `remain-on-exit on`: when a process dies
   the window stays, keeping its output and exit status, and `respawn-window -k`
   restarts it in place. Windows inherit the environment of the `pcx` you ran
-  (minus `TMUX*`); `sudo pcx` still runs the command as `$SUDO_USER`. `PATH`
-  is the user's shell `PATH` with `~/.local/bin` and `~/bin` first, so any
-  user-space command wins over `/usr/bin`.
+  (minus `TMUX*`). pcx detects the invoking shell from its parent process chain
+  (Bash, Zsh, Fish, Sh, Dash, Ash, or Ksh), then runs commands in that shell's
+  login environment; `$SHELL` and `/bin/sh` are fallbacks. `sudo pcx` still
+  runs the command as `$SUDO_USER`. `PATH` is the selected shell's `PATH` with
+  `~/.local/bin` and `~/bin` first, so user-space commands win over `/usr/bin`.
 - Stop signals the pane's process group, then any descendant that escaped it.
-- `restart: always` is a `while :; do ( cmd ); sleep 1; done` wrapper inside the
-  pane, so nothing needs to supervise it from outside.
+- Restart policies use the selected shell's own loop syntax inside the pane, so
+  nothing needs to supervise them from outside.
 - CPU/memory come from one `ps` sweep, summed over each pane's descendants.
 
 ## Not built

@@ -180,8 +180,8 @@ func pick(cfg *Config, names []string, skipDisabled bool) []string {
 }
 
 func printStatus(cfg *Config, sess *Session) {
-	table := psTable()
-	wins := sess.WindowsWith(table)
+	snapshot := sess.Snapshot()
+	table, wins := snapshot.Table, snapshot.Windows
 	fmt.Printf("%-24s %-16s %-14s %8s %10s %s\n", "NAME", "NAMESPACE", "STATUS", "CPU", "MEM", "PID")
 	for _, n := range cfg.names() {
 		p := cfg.Processes[n]

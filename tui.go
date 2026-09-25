@@ -40,11 +40,20 @@ type tickMsg time.Time
 
 type statusMsg string
 
+type queuedAction struct {
+	run func() string
+}
+
+type actionDoneMsg struct {
+	status  string
+	refresh refreshMsg
+}
+
 // ask is a prompt waiting on a keypress; any key not in choices cancels it.
 type ask struct {
 	text    string
 	danger  bool
-	choices map[string]func() tea.Cmd
+	choices map[string]func(*model) tea.Cmd
 }
 
 type model struct {
@@ -62,6 +71,8 @@ type model struct {
 	peek     bool
 	cmdOff   int  // characters shifted from the tail of command lines (0 = show the end)
 	showCmds bool // M: command-list pane above peek/output
+	running  bool
+	queued   []queuedAction
 }
 
 func newModel(cfg *Config, s *Session) model {
@@ -76,8 +87,8 @@ func newModel(cfg *Config, s *Session) model {
 
 func refresh(s *Session) tea.Cmd {
 	return func() tea.Msg {
-		table := psTable()
-		return refreshMsg{wins: s.WindowsWith(table), table: table, peek: s.Peeking()}
+		snapshot := s.Snapshot()
+		return refreshMsg{wins: snapshot.Windows, table: snapshot.Table, peek: snapshot.Peeking}
 	}
 }
 
@@ -102,6 +113,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showCmds {
 			m.sess.RefreshCommands(m.row().proc)
 		}
+	case actionDoneMsg:
+		m.running = false
+		m.status = msg.status
+		m.wins, m.table, m.peek = msg.refresh.wins, msg.refresh.table, msg.refresh.peek
+		if !m.peek {
+			m.showCmds = false
+		}
+		m.build()
+		return m.startNext()
 	case statusMsg:
 		m.status = string(msg)
 	case tea.KeyMsg:
@@ -119,15 +139,20 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "cancelled"
 			return m, nil
 		}
-		return m, run()
+		return m, run(&m)
 	}
 
 	switch msg.String() {
 	case "q", "ctrl+c":
-		if m.peek {
-			m.sess.PeekClose()
+		sess, closePeek := m.sess, m.peek
+		cleanup := func() tea.Msg {
+			if closePeek {
+				sess.PeekClose()
+			}
+			sess.DebugClose()
+			return nil
 		}
-		return m, tea.Quit
+		return m, tea.Sequence(cleanup, tea.Quit)
 	case "down", "j":
 		m.cursor = min(m.cursor+1, len(m.rows)-1)
 	case "up", "k":
@@ -180,9 +205,7 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showCmds = true
 		m.status = "commands"
 	case "s":
-		m = m.run(m.targets(cur), func(n string) string { return m.sess.Start(n) })
-		m.follow(cur.proc) // peek at what we just started
-		return m, refresh(m.sess)
+		return m.enqueue(m.action(m.targets(cur), func(n string) string { return m.sess.Start(n) }, cur.proc))
 	case "x":
 		return m.confirm(m.targets(cur), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
 	case "X":
@@ -190,9 +213,20 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		return m.confirm(m.targets(cur), "restart", func(n string) string { return m.sess.Restart(n) })
 	case "u":
-		return m.run(m.cfg.names(), func(n string) string { return m.sess.Start(n) }), refresh(m.sess)
+		return m.enqueue(m.action(m.cfg.names(), func(n string) string { return m.sess.Start(n) }, ""))
 	case "d":
 		return m.confirm(m.cfg.names(), "stop", func(n string) string { return m.sess.Stop(n, syscall.SIGTERM) })
+	case "D":
+		return m.enqueue(queuedAction{run: func() string {
+			open, err := m.sess.ToggleDebug()
+			if err != nil {
+				return "debug: " + err.Error()
+			}
+			if open {
+				return "debug pane opened"
+			}
+			return "debug pane closed"
+		}})
 	case "l": // sneak peek: a pane on the right that follows the cursor
 		switch {
 		case m.peek:
@@ -221,10 +255,10 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.asking = &ask{
 			text: "open " + cur.proc + " in a [p]ane · [t]ab · [w]orkspace",
-			choices: map[string]func() tea.Cmd{
-				"p": m.open(cur.proc, OpenPane),
-				"t": m.open(cur.proc, OpenTab),
-				"w": m.open(cur.proc, OpenWorkspace),
+			choices: map[string]func(*model) tea.Cmd{
+				"p": func(*model) tea.Cmd { return m.open(cur.proc, OpenPane)() },
+				"t": func(*model) tea.Cmd { return m.open(cur.proc, OpenTab)() },
+				"w": func(*model) tea.Cmd { return m.open(cur.proc, OpenWorkspace)() },
 			},
 		}
 	}
@@ -272,14 +306,51 @@ func (m model) targets(cur row) []string {
 	return out
 }
 
-func (m model) run(names []string, fn func(string) string) model {
-	for _, n := range names {
-		m.status = fn(n)
+func (m model) action(names []string, fn func(string) string, follow string) queuedAction {
+	return queuedAction{run: func() string {
+		status := ""
+		for _, n := range names {
+			status = fn(n)
+		}
+		if len(names) > 1 {
+			status = fmt.Sprintf("%s: %d processes", status, len(names))
+		}
+		if follow != "" && m.peek {
+			if err := m.sess.Peek(follow); err != nil {
+				status = follow + ": " + err.Error()
+			} else if m.showCmds {
+				m.sess.RefreshCommands(follow)
+			}
+		}
+		return status
+	}}
+}
+
+func (m model) enqueue(action queuedAction) (tea.Model, tea.Cmd) {
+	m.queued = append(m.queued, action)
+	return m.startNext()
+}
+
+func (m model) startNext() (tea.Model, tea.Cmd) {
+	if m.running || len(m.queued) == 0 {
+		return m, nil
 	}
-	if len(names) > 1 {
-		m.status = fmt.Sprintf("%s: %d processes", m.status, len(names))
+	action := m.queued[0]
+	m.queued = m.queued[1:]
+	m.running = true
+	sess := m.sess
+	return m, func() tea.Msg {
+		status := action.run()
+		snapshot := sess.Snapshot()
+		return actionDoneMsg{
+			status: status,
+			refresh: refreshMsg{
+				wins:  snapshot.Windows,
+				table: snapshot.Table,
+				peek:  snapshot.Peeking,
+			},
+		}
 	}
-	return m
 }
 
 func (m model) open(name, mode string) func() tea.Cmd {
@@ -306,21 +377,23 @@ func (m model) confirm(names []string, verb string, fn func(string) string) (tea
 	if len(names) > 1 {
 		what = fmt.Sprintf("%d processes", len(names))
 	}
-	sess := m.sess
-	run := func() tea.Cmd {
-		status := ""
-		for _, n := range names {
-			status = fn(n)
+	action := m.action(names, fn, "")
+	if len(names) > 1 {
+		original := action.run
+		action.run = func() string {
+			original()
+			return fmt.Sprintf("%s: %d processes", verb, len(names))
 		}
-		if len(names) > 1 {
-			status = fmt.Sprintf("%s: %d processes", verb, len(names))
-		}
-		return tea.Batch(refresh(sess), func() tea.Msg { return statusMsg(status) })
+	}
+	run := func(next *model) tea.Cmd {
+		updated, cmd := next.enqueue(action)
+		*next = updated.(model)
+		return cmd
 	}
 	m.asking = &ask{
 		text:    fmt.Sprintf("%s %s? [y/N]", verb, what),
 		danger:  true,
-		choices: map[string]func() tea.Cmd{"y": run, "Y": run},
+		choices: map[string]func(*model) tea.Cmd{"y": run, "Y": run},
 	}
 	return m, nil
 }
@@ -437,7 +510,7 @@ func (m model) View() string {
 	for i := len(m.rows) - off; i < body; i++ {
 		b.WriteString("\n")
 	}
-	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · l peek · o output · M commands · H/L scroll cmd · u/d all · space expand · q quit") + "\n")
+	b.WriteString(helpS.Render(" s start · x stop · X kill · r restart · l peek · o output · M commands · D debug · H/L scroll cmd · u/d all · space expand · q quit") + "\n")
 	switch {
 	case m.asking != nil:
 		style := bold
