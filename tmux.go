@@ -276,6 +276,7 @@ func (s *Session) kill() error {
 }
 
 type Window struct {
+	LockPath string // PID lock authorizing global management
 	Name     string
 	PID      int
 	Dead     bool
@@ -310,6 +311,8 @@ func (s *Session) snapshot() Snapshot {
 // Status is the one-word state shown by both the CLI and the TUI.
 func (w Window) Status() string {
 	switch {
+	case w.LockPath != "":
+		return "running"
 	case w.External:
 		return "external"
 	case !w.Dead:
@@ -406,12 +409,10 @@ func listWindows(target string) map[string]Window {
 // hand, by another tool, by another pcx — so the same process is managed from
 // anywhere instead of pcx starting a second copy of it.
 //
-// ponytail: the args have to *end* with the command, which is the shape a real
-// start has (`sh -c "cmd"`, or the exec'd program itself) and keeps shells and
-// editors that merely mention it out. A command that execs something else (npx,
-// wrapper scripts) runs under different args and will not match; start those
-// through pcx if you want them managed.
+// Lock-backed matches also include children of other commands or pcx windows.
+// The lock contents identify the actual process to display and stop.
 func (s *Session) external(t Table, wins map[string]Window) {
+	locks := pidLocks(t)
 	ours := map[int]bool{}
 	// our own process and the shell chain above it: their command lines quote
 	// the config's commands back at us
@@ -427,16 +428,26 @@ func (s *Session) external(t Table, wins map[string]Window) {
 		}
 	}
 	for _, name := range s.cfg.names() {
-		if w, ok := wins[name]; ok && !w.Dead {
-			continue
-		}
 		cmd := strings.TrimSpace(s.cfg.Processes[name].Command)
 		if cmd == "" {
 			continue
 		}
+		locked := 0
+		for pid := range locks {
+			if commandMatches(t.Procs[pid].Args, cmd) && (locked == 0 || pid < locked) {
+				locked = pid
+			}
+		}
+		if locked != 0 {
+			wins[name] = Window{Name: name, PID: locked, External: true, LockPath: locks[locked]}
+			continue
+		}
+		if w, ok := wins[name]; ok && !w.Dead {
+			continue
+		}
 		match := map[int]bool{}
 		for pid, p := range t.Procs {
-			if !ours[pid] && strings.HasSuffix(p.Args, cmd) {
+			if !ours[pid] && commandMatches(p.Args, cmd) {
 				match[pid] = true
 			}
 		}
@@ -454,6 +465,53 @@ func (s *Session) external(t Table, wins map[string]Window) {
 			wins[name] = Window{Name: name, PID: best, External: true}
 		}
 	}
+}
+
+// commandMatches accepts the exact program arguments or an exact shell -c
+// payload, never an arbitrary suffix or a portion of a compound command.
+func commandMatches(args, command string) bool {
+	if args == command {
+		return true
+	}
+	for _, shell := range []string{"sh", "bash", "zsh", "dash", "ksh"} {
+		for _, prefix := range []string{shell, "/bin/" + shell, "/usr/bin/" + shell} {
+			if args == prefix+" -c "+command {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pidLocks(t Table) map[int]string {
+	locks := map[int]string{}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return locks
+	}
+	dir := filepath.Join(home, ".pcx", "pids")
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lock") {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimSuffix(entry.Name(), ".lock")); err != nil || n <= 1 {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 1 {
+			continue
+		}
+		if _, alive := t.Procs[pid]; alive {
+			locks[pid] = path
+		}
+	}
+	return locks
 }
 
 // shellCmd applies the restart policy without a supervisor: the loop lives
@@ -770,6 +828,15 @@ func (s *Session) stop(name string, sig syscall.Signal) string {
 	w, ok := s.windowsWith(psTable())[name]
 	if !ok || w.Dead {
 		return name + ": not running"
+	}
+	if w.LockPath != "" {
+		if err := syscall.Kill(w.PID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return fmt.Sprintf("%s: kill: %v", name, err)
+		}
+		if err := os.Remove(w.LockPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Sprintf("%s: killed pid %d; remove lock: %v", name, w.PID, err)
+		}
+		return fmt.Sprintf("%s: sent %v", name, syscall.SIGKILL)
 	}
 	kids := descendants(psTable(), w.PID)
 	if w.External {

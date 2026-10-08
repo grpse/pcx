@@ -111,8 +111,16 @@ instead of being started twice. `up` refuses it, `down`/`restart` act on it.
 Only its output is missing — there is no tmux window behind it, so `logs` and
 `attach` need it started through pcx.
 
-The match is a substring of the command line, so a command that execs something
+The match requires exact program arguments or an exact shell `-c` command.
+A command that execs something
 else (`npx`, wrapper scripts) runs under different args and will not be found.
+
+Global child commands are also recognized when their exact command matches and
+`~/.pcx/pids/<pid>.lock` exists. Store the actual PID as plain text in the
+lock file. These processes appear as `running`, even when launched by another
+command. Sending any signal through pcx uses `kill -9` on the stored PID and
+removes its lock file. Invalid locks and PIDs absent from the process table are
+ignored.
 
 ## Opening output
 

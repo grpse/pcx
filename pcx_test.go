@@ -575,3 +575,81 @@ func TestStartAdoptsSiblingSessionWindow(t *testing.T) {
 		t.Fatalf("second start: %q", msg)
 	}
 }
+
+func TestLockedInnerCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(os.Getenv("HOME"), ".pcx", "pids")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(dir, "42.lock")
+	if err := os.WriteFile(lock, []byte("43\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(&Config{Processes: map[string]*Proc{"parent": {Command: "launcher"}, "child": {Command: "worker --serve"}}})
+	table := Table{Procs: map[int]PS{42: {PID: 42, Args: "launcher"}, 43: {PID: 43, PPID: 42, Args: "worker --serve"}}, Kids: map[int][]int{42: {43}}}
+	wins := map[string]Window{"parent": {PID: 42}}
+	s.external(table, wins)
+	w := wins["child"]
+	if w.PID != 43 || w.LockPath != lock || w.Status() != "running" {
+		t.Fatalf("locked child: %+v", w)
+	}
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	delete(wins, "child")
+	s.external(table, wins)
+	if _, ok := wins["child"]; ok {
+		t.Fatal("unlocked child adopted")
+	}
+	for _, invalid := range []string{"", "not a pid", "1", "99999"} {
+		if err := os.WriteFile(lock, []byte(invalid), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if len(pidLocks(table)) != 0 {
+			t.Fatalf("accepted invalid lock %q", invalid)
+		}
+	}
+}
+
+func TestCommandMatchesExactly(t *testing.T) {
+	for _, args := range []string{"worker --serve", "sh -c worker --serve", "/bin/bash -c worker --serve"} {
+		if !commandMatches(args, "worker --serve") {
+			t.Errorf("did not match %q", args)
+		}
+	}
+	for _, args := range []string{"other-worker --serve", "echo worker --serve", "sh -c echo worker --serve", "worker --serve --extra", "sh -c worker --serve && sleep 10"} {
+		if commandMatches(args, "worker --serve") {
+			t.Errorf("matched %q", args)
+		}
+	}
+}
+
+func TestLockedStopForcesKillAndRemovesLock(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cmd := exec.Command("sleep", "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill() })
+	dir := filepath.Join(os.Getenv("HOME"), ".pcx", "pids")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(dir, fmt.Sprintf("%d.lock", cmd.Process.Pid))
+	if err := os.WriteFile(lock, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(&Config{Name: "pcx-test-locked-stop", Processes: map[string]*Proc{"worker": {Command: "sleep 300"}}})
+	if msg := s.stop("worker", syscall.SIGTERM); !strings.Contains(msg, "sent killed") {
+		t.Fatalf("stop: %s", msg)
+	}
+	cmd.Wait()
+	status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("exit: %v", cmd.ProcessState)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("lock remains: %v", err)
+	}
+}
