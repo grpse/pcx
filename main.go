@@ -15,31 +15,33 @@ import (
 	"github.com/charmbracelet/x/term"
 )
 
-const usage = `pcx - tmux-backed process manager
+const usage = `pcx - Herdr-backed process manager
 
-  pcx                      open the TUI (starts the session, autostarts enabled processes)
+  pcx                      open the TUI (autostarts enabled processes in the background)
   pcx up [name...]         start processes detached (no names: every non-disabled one)
   pcx down [-9] [name...]  stop processes (SIGTERM, or SIGKILL with -9)
                            down, restart and kill ask before acting
   pcx restart [name...]
   pcx status
-  pcx logs <name> [-n N]   dump a process's output from the tmux scrollback
+  pcx logs <name> [-n N]   dump the tail of a process's captured output
   pcx attach <name> [--pane|--tab|--workspace]
                            show a process's live output: split the current
-                           window, open a new window, or switch to the pcx
-                           session (default). Outside tmux, all three attach.
-  pcx kill                 kill the whole tmux session
-  pcx sessions             list running pcx sessions and their config files
+                           tab, open a new tab, or create an output workspace
+                           (default). Outside Herdr, all three attach.
+  pcx kill                 kill all managed processes and forget the session
+  pcx sessions             list pcx sessions and their config files
 
-A config gets one session, named after a hash of its contents, so opening the
-same file from anywhere reattaches to the processes already running for it; a
-second session for the same file is folded into it, windows and all. A process
-already running some other way shows as "external": pcx will not start a second
-copy, and down/restart act on the one that is running.
+Commands run detached without creating Herdr spaces or tabs. Herdr is used only
+when you explicitly open an output view. Opening the same config reconnects to
+its managed processes. A process already running some other way shows as
+"external": pcx will not start a second copy, and down/restart act on it.
 
   -f <file>                config file (default: search up for process-compose-x.yaml)
   -n <id>                  run a second, independent instance of the same config
   -y                       skip the confirmation on destructive commands
+
+Output views use the current Herdr server. Outside Herdr, opening a view starts
+a named "pcx" server. Set PCX_HERDR_SESSION to select a different named server.
 `
 
 func main() {
@@ -67,7 +69,7 @@ func main() {
 		cfg.Name, cfg.Derived = sanitize(*id), false
 	}
 	sess := NewSession(cfg)
-	sess.Adopt()
+	check(sess.Adopt())
 
 	// accepted anywhere, so `pcx down web -y` works like `pcx -y down web`
 	args, yes := takeFlag(args, "-y", "--yes")
@@ -149,9 +151,9 @@ func main() {
 		}
 
 	case "kill":
-		confirm(yes, "kill session %s and every process in it", cfg.Name)
+		confirm(yes, "kill every managed process in session %s", cfg.Name)
 		check(sess.Kill())
-		fmt.Println(cfg.Name + ": session killed")
+		fmt.Println(cfg.Name + ": session removed")
 
 	default:
 		fatal("unknown command %q\n\n%s", cmd, usage)
@@ -199,14 +201,10 @@ func printStatus(cfg *Config, sess *Session) {
 }
 
 func listSessions() {
-	out, _ := tmux("list-sessions", "-F", "#{session_name}")
-	for _, n := range strings.Fields(out) {
-		// PCX_CONFIG, not the name, is what marks a session as ours
-		env, err := tmux("show-environment", "-t", n, "PCX_CONFIG")
-		if err != nil {
-			continue
-		}
-		fmt.Printf("%-20s %s\n", n, strings.TrimPrefix(strings.TrimSpace(env), "PCX_CONFIG="))
+	records, err := processSessions()
+	check(err)
+	for _, record := range records {
+		fmt.Printf("%-20s %s\n", record.Name, record.Config)
 	}
 }
 

@@ -14,6 +14,24 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func TestMain(m *testing.M) {
+	name := fmt.Sprintf("pcx-tests-%d", os.Getpid())
+	os.Setenv("PCX_HERDR_SESSION", name)
+	stateDir, err := os.MkdirTemp("", "pcx-tests-state-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("XDG_STATE_HOME", stateDir)
+	code := m.Run()
+	exec.Command("herdr", "session", "stop", name).Run()
+	exec.Command("herdr", "session", "delete", name).Run()
+	if dir, err := (herdrBackend{Session: name}).stateDir(); err == nil {
+		os.RemoveAll(dir)
+	}
+	os.RemoveAll(stateDir)
+	os.Exit(code)
+}
+
 func TestConfigExpandsVarsAndKeepsOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "process-compose-x.yaml")
@@ -90,12 +108,12 @@ func TestShellCommandUsesSelectedShellSyntax(t *testing.T) {
 	}
 }
 
-func TestEnvFlagsOverrideAndDropTmux(t *testing.T) {
+func TestEnvFlagsOverrideAndDropMultiplexerContext(t *testing.T) {
 	got := envFlags(
-		[]string{"PATH=/bin", "TMUX=old", "TMUX_PANE=%0", "HOME=/root", "MARK=from-base"},
+		[]string{"PATH=/bin", "TMUX=old", "TMUX_PANE=%0", "HERDR_ENV=1", "HERDR_PANE_ID=w1:p1", "HERDR_SOCKET_PATH=old", "HOME=/root", "MARK=from-base"},
 		[]string{"HOME=/me", "MARK=from-yaml", "EXTRA=1"},
 	)
-	want := []string{"-e", "PATH=/bin", "-e", "HOME=/me", "-e", "MARK=from-yaml", "-e", "EXTRA=1"}
+	want := []string{"--env", "PATH=/bin", "--env", "HOME=/me", "--env", "MARK=from-yaml", "--env", "EXTRA=1"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("env flags:\n got %q\nwant %q", got, want)
 	}
@@ -197,10 +215,10 @@ func TestNodeExecutesFromUserSpaceNotSystem(t *testing.T) {
 }
 
 // A started process sees the environment of the pcx that launched it, not
-// whatever the tmux server happened to be started with.
+// whatever the Herdr server happened to be started with.
 func TestProcessInheritsInvokerEnvironment(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	dir := t.TempDir()
 	mark := "pcx-env-" + filepath.Base(dir)
@@ -233,10 +251,10 @@ processes:
 	}
 }
 
-// End-to-end against a real tmux server: start, see children, stop, respawn.
+// End-to-end against a real Herdr server: start, see children, stop, respawn.
 func TestSessionLifecycle(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "process-compose-x.yaml")
@@ -252,7 +270,7 @@ processes:
 		t.Fatal(err)
 	}
 	s := NewSession(cfg)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", s.target()).Run() })
+	t.Cleanup(func() { s.Kill() })
 
 	if msg := s.Start("spawner"); !strings.Contains(msg, "started") {
 		t.Fatal(msg)
@@ -269,7 +287,7 @@ processes:
 	s.Stop("spawner", syscall.SIGKILL)
 	dead := waitFor(t, s, func(w Window) bool { return w.Dead })
 	if dead.PID == 0 {
-		t.Fatal("window disappeared; remain-on-exit did not stick")
+		t.Fatal("process tab disappeared after exit")
 	}
 	if kids := psTable().Kids[w.PID]; len(kids) > 0 {
 		t.Fatalf("children survived the stop: %v", kids)
@@ -288,8 +306,8 @@ func waitFor(t *testing.T, s *Session, ok func(Window) bool) Window {
 
 // The confirmation gate is the point: 'x' must not stop anything until 'y'.
 func TestStopNeedsConfirmation(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "process-compose-x.yaml")
@@ -305,7 +323,7 @@ processes:
 		t.Fatal(err)
 	}
 	s := NewSession(cfg)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", s.target()).Run() })
+	t.Cleanup(func() { s.Kill() })
 	s.Start("spawner")
 	waitFor(t, s, func(w Window) bool { return !w.Dead })
 
@@ -433,8 +451,8 @@ func TestSessionManagerOwnsAndRecoversItsExecutionContext(t *testing.T) {
 // Identity follows the file's contents, and an edit must not orphan what is
 // already running for that file.
 func TestSessionIdentityFollowsConfigContent(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	body := "processes:\n  ticker:\n    command: \"sleep 300\"\n"
 	write := func(dir, extra string) *Config {
@@ -490,8 +508,8 @@ func waitFor2(t *testing.T, s *Session, name string, ok func(Window) bool) Windo
 // A process started some other way is captured: reported, not started twice,
 // and stoppable through pcx.
 func TestExternalProcessIsAdopted(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "process-compose-x.yaml")
@@ -533,8 +551,8 @@ func TestExternalProcessIsAdopted(t *testing.T) {
 // A second pcx running the same config must not end up with two copies of the
 // same command: starting it takes over the window that is already running.
 func TestStartAdoptsSiblingSessionWindow(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("no tmux")
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("no herdr")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "process-compose-x.yaml")
@@ -550,15 +568,23 @@ func TestStartAdoptsSiblingSessionWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// another pcx, same config file, already running the command
+	// A sibling workspace left by an older pcx has its own process tab.
 	sibling := "pcx-sibling-" + filepath.Base(dir)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", "="+sibling).Run() })
-	tmux("new-session", "-d", "-s", sibling, "-n", holder)
-	tmux("set-environment", "-t", sibling, "PCX_CONFIG", cfg.Path)
-	tmux("new-window", "-d", "-t", "="+sibling+":", "-n", "ticker", "sleep 300")
-	pid := listWindows("=" + sibling)["ticker"].PID
-	if pid == 0 {
-		t.Fatal("sibling window did not start")
+	siblingCfg := *cfg
+	siblingCfg.Name, siblingCfg.Derived = sibling, false
+	siblingSession := NewSession(&siblingCfg)
+	t.Cleanup(func() { siblingSession.Kill() })
+	if msg := siblingSession.Start("ticker"); !strings.Contains(msg, "started") {
+		t.Fatal(msg)
+	}
+	pid := waitFor2(t, siblingSession, "ticker", func(w Window) bool { return !w.Dead }).PID
+	record, err := siblingSession.record()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Derived = true
+	if err := saveSession(record); err != nil {
+		t.Fatal(err)
 	}
 
 	if msg := s.Start("ticker"); !strings.Contains(msg, "adopted the copy already running") {
@@ -568,7 +594,7 @@ func TestStartAdoptsSiblingSessionWindow(t *testing.T) {
 	if !ok || w.Dead || w.PID != pid {
 		t.Fatalf("adopted window lost the process: %+v want pid %d", w, pid)
 	}
-	if exec.Command("tmux", "has-session", "-t", "="+sibling).Run() == nil {
+	if siblingSession.Exists() {
 		t.Fatal("emptied sibling session should be gone")
 	}
 	if msg := s.Start("ticker"); !strings.Contains(msg, "already running") {

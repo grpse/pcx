@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Subset of the process-compose schema that maps onto tmux windows.
+// Subset of the process-compose schema that maps onto Herdr tabs.
 type Proc struct {
 	Command      string   `yaml:"command"`
 	WorkingDir   string   `yaml:"working_dir"`
@@ -100,9 +100,6 @@ func Load(path string) (*Config, error) {
 	cfg.Name = sanitize(cfg.Name)
 
 	for name, p := range cfg.Processes {
-		if strings.ContainsAny(name, ":.") {
-			return nil, fmt.Errorf("process %q: name cannot contain ':' or '.' (tmux window name)", name)
-		}
 		if p.Command == "" {
 			return nil, fmt.Errorf("process %q: no command", name)
 		}

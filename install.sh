@@ -41,8 +41,8 @@ fi
 
 echo "installed $bindir/pcx"
 
-if ! command -v tmux >/dev/null; then
-	echo "warning: tmux not found; pcx needs it at runtime" >&2
+if ! command -v herdr >/dev/null; then
+	echo "warning: herdr not found; install it to open live output views" >&2
 fi
 
 case ":$PATH:" in

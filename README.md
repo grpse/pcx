@@ -2,12 +2,12 @@
 
 A process manager for a catalog of dev commands, driven by a
 [process-compose](https://f1bonacc1.github.io/process-compose/)-style YAML file.
-tmux does the supervising — one detached session, one window per process — so
-processes keep running when you close the TUI, and each process's real output is
-a tmux window you can jump into.
+Commands run in the background and keep running when you close the TUI.
+[Herdr](https://herdr.dev) opens a live tail only when you request a pane, tab,
+or workspace. Starting processes creates no Herdr spaces or tabs.
 
 ```sh
-bash ./install.sh     # builds pcx into ~/.local/bin; needs tmux
+bash ./install.sh     # builds pcx into ~/.local/bin; needs Herdr 0.9.3 or later
 ```
 
 Using `bash` works even when a downloaded copy of `install.sh` is not marked
@@ -35,15 +35,15 @@ source you built.
 ## Use
 
 ```sh
-pcx                      # TUI (creates the session, autostarts non-disabled processes)
+pcx                      # TUI (autostarts non-disabled processes in the background)
 pcx up [name...]         # start detached; no names = every process without `disabled: true`
 pcx down [-9] [name...]  # SIGTERM, or SIGKILL with -9
 pcx restart [name...]
 pcx status
-pcx logs <name> [-n N]   # dump the tmux scrollback
+pcx logs <name> [-n N]   # dump the tail of captured process output
 pcx attach <name> [--pane|--tab|--workspace]
-pcx kill                 # kill the session and everything in it
-pcx sessions             # running pcx sessions and the config each one runs
+pcx kill                 # kill managed processes and forget the session
+pcx sessions             # pcx sessions and their config files
 pcx -f other.yaml ...    # default: search up for process-compose-x.yaml
 pcx -n scratch ...       # a second, independent instance of the same config
 pcx down -y ...          # -y skips the confirmation
@@ -66,7 +66,7 @@ found by walking up from the working directory.
 | `x` `X` `r` | stop (TERM) · kill (KILL) · restart — each asks `[y/N]` first |
 | `l` | sneak peek: a pane on the right with the highlighted process's live output, which follows the cursor. `l` again closes it |
 | `o` | open the process's live output — then pick `p`ane, `t`ab or `w`orkspace |
-| `M` | show or hide the executed command tree above peek/output (hidden until you press it) |
+| `M` | show or hide the executed command tree below peek/output (hidden until you press it) |
 | `D` | show or hide internal process-manager diagnostics in a pane below the TUI |
 | `u` `d` | start / stop everything (`d` asks first) |
 | `y` | confirm a pending action; any other key cancels |
@@ -78,29 +78,24 @@ Each process row shows status and the CPU and memory of the **whole tree** it
 spawned. Expand it to see the command lines (the tail of each argv, `H`/`L` to
 scroll), children, their own subtrees, and their pids.
 
-## One session per config
+## One process session per config
 
-A config file gets exactly one tmux session, named after a hash of its
-contents, so opening the same file from any directory reattaches to the
-processes already running for it:
+A config gets a local process session named after a hash of its contents.
+Opening the same file from any directory reconnects to its running commands.
+Process sessions do not create Herdr workspaces.
 
 ```
 $ pcx sessions
 pcx-a3f35dc2         /Users/you/work/process-compose-x.yaml
 ```
 
-Editing the file changes that hash, so pcx looks for the session that was
-running the same path and renames it — an edit never orphans running processes.
-
-If a second session is running the same file anyway — two terminals racing, a
-session left over from an older edit — pcx folds it in: the windows move into
-one session, processes keep their pids and output, and the emptied session goes
-away. So starting a command that another pcx already opened for this config
-takes over that window instead of running a second copy of it.
+Editing the file changes its hash. pcx adopts the processes registered for the
+same config path, preserving their PIDs and output. A file lock prevents two
+clients from starting the same managed command at once.
 
 Set `name:` in the config, or pass `-n <id>`, to name an instance yourself and
-run several from one file. That opts out of all of the above — a named instance
-is meant to be separate.
+run several from one file. Named instances opt out of adoption across config
+edits.
 
 ## Already running some other way
 
@@ -108,8 +103,8 @@ A process you started by hand or from another tool shows up as `external` with
 its real pid, CPU and memory: pcx matches the config's
 command against the process table, so the same process is managed from anywhere
 instead of being started twice. `up` refuses it, `down`/`restart` act on it.
-Only its output is missing — there is no tmux window behind it, so `logs` and
-`attach` need it started through pcx.
+Its output has not been captured, so `logs` and `attach` need it started through
+pcx.
 
 The match requires exact program arguments or an exact shell `-c` command.
 A command that execs something
@@ -126,8 +121,9 @@ ignored.
 
 `l` is the quick look: one split on the right that re-points itself at whatever
 the cursor is on, so moving down the list scrubs through the output of each
-process. It needs tmux, closes with `l` again, and closes when the TUI quits.
-`M` toggles a second pane above that output listing the commands that starter
+process. It needs pcx running inside Herdr, closes with `l` again, and closes when
+the TUI quits.
+`M` toggles a second pane below that output listing the commands that starter
 actually launched (the live argv tree). It starts hidden; if peek is closed,
 `M` opens it first.
 
@@ -138,21 +134,30 @@ closes the pane.
 
 `o` in the TUI (or `pcx attach`) shows a process's live output three ways:
 
-- **pane** — splits the current tmux window beside the TUI
-- **tab** — opens a new tmux window
-- **workspace** — switches the client to the pcx session itself
+- **pane** — splits the calling Herdr tab beside the TUI with a live tail
+- **tab** — opens a live tail in one new tab of the calling workspace
+- **workspace** — creates one new workspace containing the live tail
 
-Pane and tab attach a nested client to a throwaway session *grouped* with ours,
-so the process keeps its own window: closing the view never touches the process.
-Linking the real window in would look the same until someone pressed `prefix &`
-and killed the process with the tab. Outside tmux all three just attach.
+The view starts automatically, shows the last 100 lines of command output,
+and follows new output. Quiet commands show “No output yet” until they write
+something. The shell prompt and pcx's launcher are hidden.
+
+Closing any output view leaves its process running. Restarting a process keeps
+its output file, so an open tail continues following the replacement. These
+views display output; they do not send keyboard input to the managed command.
+`M` puts the command tree below the output.
+
+Inside Herdr, views use the current server and the calling pane's IDs. Outside
+Herdr, opening output starts a named `pcx` server, creates one output workspace,
+and attaches to it. Set `PCX_HERDR_SESSION=<name>` to choose the output server.
+Process management and captured logs work without Herdr running or installed.
 
 ## Config
 
 A subset of the process-compose schema, so existing files mostly just work:
 
 ```yaml
-name: xilo-workspace          # tmux session name (default: config's directory)
+name: xilo-workspace          # process session name (default: hash of config contents)
 
 vars:
   WORKING_DIR: "."
@@ -179,22 +184,28 @@ See `examples/` for a full catalog and a demo you can run.
 
 ## How it works
 
-- One detached tmux session per config (see above), plus a `__pcx` holder
-  window so the session survives when everything is stopped.
-- Each process is a tmux window with `remain-on-exit on`: when a process dies
-  the window stays, keeping its output and exit status, and `respawn-window -k`
-  restarts it in place. Windows inherit the environment of the `pcx` you ran
-  (minus `TMUX*`). pcx detects the invoking shell from its parent process chain
-  (Bash, Zsh, Fish, Sh, Dash, Ash, or Ksh), then runs commands in that shell's
-  login environment; `$SHELL` and `/bin/sh` are fallbacks. `sudo pcx` still
-  runs the command as `$SUDO_USER`. `PATH` is the selected shell's `PATH` with
-  `~/.local/bin` and `~/bin` first, so user-space commands win over `/usr/bin`.
-- Stop signals the pane's process group, then any descendant that escaped it.
-- Restart policies use the selected shell's own loop syntax inside the pane, so
-  nothing needs to supervise them from outside.
-- CPU/memory come from one `ps` sweep, summed over each pane's descendants.
+- A detached pcx runner hosts each command in a pseudoterminal, preserving
+  terminal output behavior and capturing stdout and stderr in a private log.
+  It records the process PID and exit status independently of Herdr views.
+- Commands inherit the invoking pcx's environment, with YAML overrides and
+  stale multiplexer context removed. Launch specifications, exit state, and
+  output logs live under `${XDG_STATE_HOME:-~/.local/state}/pcx`. Launch
+  specifications are removed after the runner reads them. A file lock
+  serializes process management across clients.
+- pcx detects the invoking shell from its parent process chain (Bash, Zsh, Fish,
+  Sh, Dash, Ash, or Ksh), then runs commands in that shell's login environment;
+  `$SHELL` and `/bin/sh` are fallbacks. `sudo pcx` still runs commands as
+  `$SUDO_USER`. `PATH` is the selected shell's `PATH` with `~/.local/bin` and
+  `~/bin` first, so user-space commands win over `/usr/bin`.
+- Stop signals the managed process and its descendants. Restart sends TERM,
+  waits briefly, and uses KILL if needed before launching the replacement.
+- Restart policies use the selected shell's own loop syntax inside the runner,
+  so they continue working with the TUI closed.
+- CPU/memory come from a `ps` sweep, summed over each process's descendants.
+- `pcx kill` signals the config's managed processes and removes its process
+  session. Output views and unrelated Herdr workspaces are left open.
 
 ## Not built
 
-No dependency ordering, health checks, readiness probes, or log files — tmux
-scrollback is the log. Attach the real process-compose if you need those.
+No dependency ordering, health checks, readiness probes, or log rotation.
+Use the real process-compose if you need those.

@@ -33,7 +33,7 @@ type row struct {
 type refreshMsg struct {
 	wins  map[string]Window
 	table Table
-	peek  bool // the peek pane can be closed from tmux, not just with 'l'
+	peek  bool // the peek pane can be closed from Herdr, not just with 'l'
 }
 
 type tickMsg time.Time
@@ -70,7 +70,7 @@ type model struct {
 	asking   *ask
 	peek     bool
 	cmdOff   int  // characters shifted from the tail of command lines (0 = show the end)
-	showCmds bool // M: command-list pane above peek/output
+	showCmds bool // M: command-list pane below peek/output
 	running  bool
 	queued   []queuedAction
 }
@@ -250,7 +250,7 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if w, ok := m.wins[cur.proc]; !ok || w.External {
-			m.status = cur.proc + ": no tmux output — not started by pcx"
+			m.status = cur.proc + ": no captured output — not started by pcx"
 			break
 		}
 		m.asking = &ask{
