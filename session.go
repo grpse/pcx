@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -494,7 +493,7 @@ func shellQuote(s string) string {
 }
 
 // asCurrentUser runs commands as the person who invoked pcx. A root
-// server (sudo pcx) would otherwise run every command as root.
+// invocation (sudo pcx) would otherwise run every command as root.
 func asCurrentUser(cmd string) string {
 	u := invokeUser()
 	if u == nil || u.Uid == strconv.Itoa(os.Geteuid()) {

@@ -137,21 +137,15 @@ func TestCapturedLogsExitStatusAndRestart(t *testing.T) {
 	if got := w.Status(); got != "exited(7)" {
 		t.Fatal(got)
 	}
-	// Terminal output arrives asynchronously after the runner's exit record.
-	var output string
-	for i := 0; i < 100; i++ {
-		var err error
-		output, err = s.Logs(name, 100)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(output, "pcx-log:from-yaml:\n") && strings.Contains(output, cfg.Dir) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	output, err := s.Logs(name, 100)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !strings.Contains(output, "pcx-log:from-yaml:\n") || strings.Contains(output, "stale-caller-id") || !strings.Contains(output, cfg.Dir) || !strings.Contains(output, "stderr-output") || !strings.Contains(output, "tty-output") {
 		t.Fatalf("wrong environment, pane context, or directory: %q", output)
+	}
+	if tail, err := s.Logs(name, 1); err != nil || tail != "tty-output\n" {
+		t.Fatalf("last line: %q %v", tail, err)
 	}
 	if _, err := s.Logs(name, 0); err == nil {
 		t.Fatal("accepted zero log lines")
@@ -306,12 +300,31 @@ func TestHerdrPreviewAndDebugDoNotStopProcesses(t *testing.T) {
 		t.Fatalf("closing preview stopped process: %+v", w)
 	}
 	for _, mode := range []string{OpenPane, OpenTab, OpenWorkspace} {
+		before, err := backend.snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
 		cmd, err := s.Open("worker", mode)
 		if err != nil || cmd != nil {
 			t.Fatalf("open %s: %v %v", mode, cmd, err)
 		}
 		if !s.paneExists(s.lastOutput) {
 			t.Fatalf("no %s output view", mode)
+		}
+		waitRendered(t, s, s.lastOutput, "new-live-output")
+		after, err := backend.snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		spaces, tabs := 0, 0
+		if mode == OpenWorkspace {
+			spaces = 1
+		}
+		if mode != OpenPane {
+			tabs = 1
+		}
+		if len(after.Workspaces) != len(before.Workspaces)+spaces || len(after.Tabs) != len(before.Tabs)+tabs || len(after.Panes) != len(before.Panes)+1 {
+			t.Fatalf("open %s created unexpected topology: %+v -> %+v", mode, before, after)
 		}
 		if err := s.views.call(nil, "pane", "close", s.lastOutput); err != nil {
 			t.Fatal(err)
@@ -389,7 +402,12 @@ func TestProcessManagementNeverInvokesHerdr(t *testing.T) {
 		t.Fatal(msg)
 	}
 	waitFor2(t, s, "worker", func(w Window) bool { return !w.Dead })
-	if err := NewSession(cfg).Adopt(); err != nil {
+	t.Setenv("PCX_HERDR_SESSION", "a-different-output-server")
+	otherClient := NewSession(cfg)
+	if otherClient.Windows()["worker"].PID != s.Windows()["worker"].PID {
+		t.Fatal("process management depends on Herdr session")
+	}
+	if err := otherClient.Adopt(); err != nil {
 		t.Fatal(err)
 	}
 	if msg := s.Restart("worker"); !strings.Contains(msg, "started") {
